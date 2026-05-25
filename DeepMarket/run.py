@@ -8,19 +8,52 @@ import constants as cst
 from models.gan.CGAN_hparam import HP_CGAN, HP_CGAN_FIXED
 from preprocessing.DataModule import DataModule
 from preprocessing.LOBDataset import LOBDataset
+from preprocessing.MultiAssetLOBDataset import MultiAssetLOBDataset
+from preprocessing.AssetUniverse import AssetUniverse
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from lightning.pytorch.callbacks import TQDMProgressBar
 from collections import namedtuple
 from models.diffusers.TRADES.TRADES_hparam import HP_TRADES, HP_TRADES_FIXED
 from models.gan.CGAN_hparam import HP_CGAN, HP_CGAN_FIXED
 from models.diffusers.diffusion_engine import DiffusionEngine
+from models.diffusers.multi_asset.ma_diffusion_engine import MultiAssetDiffusionEngine
 from models.gan.gan_engine import GANEngine
 
 HP_SEARCH_TYPES = namedtuple('HPSearchTypes', ("sweep", "fixed"))
 HP_DICT_MODEL = {
     cst.Models.TRADES: HP_SEARCH_TYPES(HP_TRADES, HP_TRADES_FIXED),
-    cst.Models.CGAN: HP_SEARCH_TYPES(HP_CGAN, HP_CGAN_FIXED)
+    cst.Models.CGAN: HP_SEARCH_TYPES(HP_CGAN, HP_CGAN_FIXED),
+    # MA_TRADES shares hyperparameters with TRADES — the multi-asset stack
+    # only adds an outer asset axis on top of the same score backbone.
+    cst.Models.MA_TRADES: HP_SEARCH_TYPES(HP_TRADES, HP_TRADES_FIXED),
 }
+
+
+def _build_asset_universe(config: Configuration) -> AssetUniverse:
+    """Construct the AssetUniverse for the current run from CHOSEN_STOCK.
+
+    For the ETF + constituent setup we assume index 0 is the "anchor"
+    asset (e.g. ETF) and index 1 is the related one (e.g. constituent).
+    """
+    tickers = [s.name for s in config.CHOSEN_STOCK]
+    if len(tickers) == 2:
+        # Pre-wire the two directed relations so RelationEmbedding in P1
+        # already has the right lookup keys.
+        return AssetUniverse(
+            assets=tickers,
+            relation_types={(0, 1): 0, (1, 0): 1},
+        )
+    # General N: full directed graph minus self loops, each edge a distinct
+    # relation type. Sufficient for P0; P1 will revisit when N > 2 lands.
+    rel = {}
+    counter = 0
+    for j in range(len(tickers)):
+        for i in range(len(tickers)):
+            if i == j:
+                continue
+            rel[(j, i)] = counter
+            counter += 1
+    return AssetUniverse(assets=tickers, relation_types=rel)
 
 def train(config: Configuration, trainer: L.Trainer):
     print_setup(config)
@@ -30,37 +63,62 @@ def train(config: Configuration, trainer: L.Trainer):
         # due to the fact that CGAN uses a different dataset, we need to create different numpy files
         if config.CHOSEN_MODEL == cst.Models.CGAN:
             train_data_paths.append(cst.DATA_DIR + "/" + config.CHOSEN_STOCK[i].name + "/train_cgan.npy")
-            val_data_paths.append(cst.DATA_DIR + "/" + config.CHOSEN_STOCK[i].name + "/val_cgan.npy") 
+            val_data_paths.append(cst.DATA_DIR + "/" + config.CHOSEN_STOCK[i].name + "/val_cgan.npy")
         else:
             train_data_paths.append(cst.DATA_DIR + "/" + config.CHOSEN_STOCK[i].name + "/train.npy")
             val_data_paths.append(cst.DATA_DIR + "/" + config.CHOSEN_STOCK[i].name + "/val.npy")
-        
-    train_set = LOBDataset(
-        paths=train_data_paths,
-        seq_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.SEQ_SIZE],
-        gen_seq_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.MASKED_SEQ_SIZE],
-        chosen_model=config.CHOSEN_MODEL,
-        is_val = False,
-    )
 
-    val_set = LOBDataset(
-        paths=val_data_paths,
-        seq_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.SEQ_SIZE],
-        gen_seq_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.MASKED_SEQ_SIZE],
-        chosen_model=config.CHOSEN_MODEL,
-        is_val = True,
-        batch_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.TEST_BATCH_SIZE],
-        limit_val_batches=100
-    )
-    
+    is_multi_asset = config.CHOSEN_MODEL == cst.Models.MA_TRADES or config.MULTI_ASSET
+    if is_multi_asset:
+        if len(config.CHOSEN_STOCK) < 2:
+            raise ValueError(
+                "MA_TRADES / MULTI_ASSET requires at least 2 entries in CHOSEN_STOCK, "
+                f"got {len(config.CHOSEN_STOCK)}."
+            )
+        config.MULTI_ASSET = True
+        if config.ASSET_UNIVERSE is None:
+            config.ASSET_UNIVERSE = _build_asset_universe(config)
+
+        train_set = MultiAssetLOBDataset(
+            paths=train_data_paths,
+            seq_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.SEQ_SIZE],
+            gen_seq_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.MASKED_SEQ_SIZE],
+            is_val=False,
+        )
+        val_set = MultiAssetLOBDataset(
+            paths=val_data_paths,
+            seq_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.SEQ_SIZE],
+            gen_seq_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.MASKED_SEQ_SIZE],
+            is_val=True,
+            batch_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.TEST_BATCH_SIZE],
+            limit_val_batches=100,
+        )
+    else:
+        train_set = LOBDataset(
+            paths=train_data_paths,
+            seq_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.SEQ_SIZE],
+            gen_seq_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.MASKED_SEQ_SIZE],
+            chosen_model=config.CHOSEN_MODEL,
+            is_val=False,
+        )
+        val_set = LOBDataset(
+            paths=val_data_paths,
+            seq_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.SEQ_SIZE],
+            gen_seq_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.MASKED_SEQ_SIZE],
+            chosen_model=config.CHOSEN_MODEL,
+            is_val=True,
+            batch_size=config.HYPER_PARAMETERS[cst.LearningHyperParameter.TEST_BATCH_SIZE],
+            limit_val_batches=100,
+        )
+
     print("size of train set: ", train_set.data.size())
     print("size of val set: ", val_set.data.size())
-    
+
     if config.IS_DEBUG:
         train_set.data = train_set.data[:256]
         val_set.data = val_set.data[:256]
         config.HYPER_PARAMETERS[cst.LearningHyperParameter.CDT_DEPTH] = 1
-        
+
     data_module = DataModule(
         train_set=train_set,
         val_set=val_set,
@@ -72,6 +130,10 @@ def train(config: Configuration, trainer: L.Trainer):
         model = GANEngine(config)
     elif config.CHOSEN_MODEL == cst.Models.TRADES:
         model = DiffusionEngine(config)
+    elif config.CHOSEN_MODEL == cst.Models.MA_TRADES:
+        model = MultiAssetDiffusionEngine(config, config.ASSET_UNIVERSE)
+    else:
+        raise ValueError(f"Unknown CHOSEN_MODEL: {config.CHOSEN_MODEL}")
     train_dataloader, val_dataloader = data_module.train_dataloader(), data_module.val_dataloader()
     trainer.fit(model, train_dataloader, val_dataloader)
 

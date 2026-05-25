@@ -74,3 +74,8 @@ real_orders.csv
 
 # === Backups from migration ===
 *.git.bak/
+
+# === Local Claude context (personal, do not sync) ===
+CLAUDE.md
+.claude/
+midterm_report.txt

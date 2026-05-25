@@ -1,6 +1,7 @@
 from constants import LearningHyperParameter, LearningHyperParameter
 import constants as cst
 from utils.utils import noise_scheduler
+from preprocessing.AssetUniverse import AssetUniverse
 
 
 class Configuration:
@@ -20,17 +21,29 @@ class Configuration:
         self.IS_DATA_PREPROCESSED = False
         self.SPLIT_RATES = (.85, .05, .10)
 
+        # ---- model dispatch --------------------------------------------
+        # CHOSEN_MODEL selects the model family. Setting it to MA_TRADES
+        # auto-enables MULTI_ASSET and routes through the multi-asset
+        # dataset + Lightning engine. Single-asset paths are unchanged.
         self.CHOSEN_MODEL = cst.Models.TRADES
+        self.MULTI_ASSET = self.CHOSEN_MODEL == cst.Models.MA_TRADES
+
         self.CHOSEN_AUGMENTER = "MLP"
         self.CHOSEN_COND_AUGMENTER = "MLP"
         self.SAMPLING_TYPE = "DDPM" #it can be DDPM or DDIM
         self.USE_ENGINE = cst.Engine.DIFFUSION_ENGINE
-        
+
         if self.CHOSEN_MODEL == cst.Models.CGAN:
             cst.PROJECT_NAME = "CGAN"
 
-        # select a stock 
+        # select a stock
         self.CHOSEN_STOCK = [cst.Stocks.TSLA]
+
+        # ---- multi-asset configuration ---------------------------------
+        # Built from CHOSEN_STOCK in run.py once we know how many tickers
+        # the user wired in. Default leaves it None so single-asset runs
+        # never touch the multi-asset code path.
+        self.ASSET_UNIVERSE: AssetUniverse | None = None
 
         self.WANDB_INSTANCE = None
         self.WANDB_RUN_NAME = None

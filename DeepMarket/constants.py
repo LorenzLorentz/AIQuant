@@ -72,6 +72,7 @@ class Models(str, Enum):
     TRADES = "TRADES"
     CGAN = "CGAN"
     CDT = "CDT"
+    MA_TRADES = "MA_TRADES"  # Multi-asset shared-backbone diffusion (P0/P1)
 
 class LOB_Charts(Enum):      #Qualitative evaluation
 
@@ -200,6 +201,11 @@ N_LOB_LEVELS = 10
 LEN_LEVEL = 4
 LEN_ORDER = 6
 LEN_ORDER_CGAN = 7
+
+# Default number of assets for the multi-asset stack. Overridden at runtime
+# by ``len(config.CHOSEN_STOCK)`` when ``MULTI_ASSET`` is on; constant kept
+# here so static configs and tests can refer to it.
+N_ASSETS = 2
 
 DATE_TRADING_DAYS = ["2012-06-21", "2012-06-21"]
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
