@@ -112,34 +112,76 @@ class MultiAssetDiffusionEngine(LightningModule):
 
     def forward(self, cond_orders, x_0, cond_lob, is_train, batch_idx=None):
         # x_0 shape: (B, N, K_gen, LEN_ORDER); cond_orders: (B, N, K_cond, LEN_ORDER)
+        raw_cond_orders = cond_orders
+        raw_cond_lob = cond_lob
         x_0, cond_orders = self.type_embedding(x_0, cond_orders)
         if is_train:
             self.t, _ = self.sampler.sample(x_0.shape[0])
-            recon = self.single_step(cond_orders, x_0, cond_lob, batch_idx)
+            recon = self.single_step(
+                cond_orders,
+                x_0,
+                cond_lob,
+                batch_idx,
+                raw_cond_orders=raw_cond_orders,
+                raw_cond_lob=raw_cond_lob,
+            )
         else:
             self.t = torch.full(size=(x_0.shape[0],),
                                 fill_value=self.num_diffusionsteps - 1,
                                 device=cst.DEVICE, dtype=torch.int64)
             for _ in range(self.num_diffusionsteps - 1, -1, -1):
-                recon = self.single_step(cond_orders, x_0, cond_lob)
+                recon = self.single_step(
+                    cond_orders,
+                    x_0,
+                    cond_lob,
+                    raw_cond_orders=raw_cond_orders,
+                    raw_cond_lob=raw_cond_lob,
+                )
                 self.t = self.t - 1
         return recon
 
     def sample(self, **kwargs) -> torch.Tensor:
-        cond_orders: torch.Tensor = kwargs["cond_orders"]
+        raw_cond_orders: torch.Tensor = kwargs["cond_orders"]
         x_0: torch.Tensor = kwargs["x"]
-        cond_lob: torch.Tensor = kwargs["cond_lob"]
+        raw_cond_lob: torch.Tensor = kwargs["cond_lob"]
+        cond_orders = raw_cond_orders
+        cond_lob = raw_cond_lob
         x_0, cond_orders = self.type_embedding(x_0, cond_orders)
         x_0 = torch.zeros_like(x_0)
         weights = self.sampler.weights()
-        return self.diffuser.sample(x_0, cond_orders, cond_lob, weights)
+        return self.diffuser.sample(
+            x_0,
+            cond_orders,
+            cond_lob,
+            weights,
+            graph_cond_orders=raw_cond_orders,
+            graph_cond_lob=raw_cond_lob,
+        )
 
-    def single_step(self, cond_orders, x_0, cond_lob, batch_idx=None):
+    def single_step(
+        self,
+        cond_orders,
+        x_0,
+        cond_lob,
+        batch_idx=None,
+        raw_cond_orders=None,
+        raw_cond_lob=None,
+    ):
         x_t, noise = self.diffuser.forward_reparametrized(x_0, self.t)
-        x_t_aug, cond_orders, cond_lob = self.diffuser.augment(x_t, cond_orders, cond_lob)
+        x_t_aug, cond_orders_aug, cond_lob_aug = self.diffuser.augment(x_t, cond_orders, cond_lob)
         weights = self.sampler.weights()
         return self.diffuser.ddpm_single_step(
-            x_0, x_t_aug, x_t, self.t, cond_orders, noise, weights, cond_lob, batch_idx
+            x_0,
+            x_t_aug,
+            x_t,
+            self.t,
+            cond_orders_aug,
+            noise,
+            weights,
+            cond_lob_aug,
+            batch_idx,
+            raw_cond_orders=raw_cond_orders,
+            raw_cond_lob=raw_cond_lob,
         )
 
     def type_embedding(self, x_0, cond):
@@ -185,6 +227,7 @@ class MultiAssetDiffusionEngine(LightningModule):
         self.ema.update()
         if batch_idx % 1000 == 0:
             print(f"batch loss: {batch_loss_mean}")
+            print(f"graph gamma: {self.diffuser.graph_gamma.detach().item():.6f}")
         return batch_loss_mean
 
     def on_train_epoch_start(self) -> None:

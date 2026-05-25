@@ -44,6 +44,11 @@ class Configuration:
         # the user wired in. Default leaves it None so single-asset runs
         # never touch the multi-asset code path.
         self.ASSET_UNIVERSE: AssetUniverse | None = None
+        self.DISABLE_GRAPH = False
+        self.FREEZE_EDGE_WEIGHTS = False
+        self.DISABLE_ARB_GUIDANCE = False
+        self.GRAPH_RELATION_DIM = 8
+        self.GRAPH_HIDDEN_DIM = 32
 
         self.WANDB_INSTANCE = None
         self.WANDB_RUN_NAME = None

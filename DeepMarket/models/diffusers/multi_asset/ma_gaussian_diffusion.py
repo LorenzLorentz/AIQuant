@@ -19,6 +19,15 @@ from torch import nn
 
 import constants as cst
 from constants import LearningHyperParameter
+from models.diffusers.multi_asset.ablation_flags import AblationFlags
+from models.diffusers.multi_asset.graph import (
+    AttentionAggregator,
+    EdgeWeightNet,
+    MessageFunction,
+    NoiseFusion,
+    RelationEmbedding,
+    compute_rolling_stats,
+)
 from models.diffusers.multi_asset.shared_score_net import SharedScoreNet
 
 
@@ -51,6 +60,7 @@ class MultiAssetGaussianDiffusion(nn.Module):
         else:
             self.input_size = config.HYPER_PARAMETERS[LearningHyperParameter.SIZE_ORDER_EMB]
             self.feature_augmenter = None
+        self.order_feature_dim = config.HYPER_PARAMETERS[LearningHyperParameter.SIZE_ORDER_EMB]
 
         self.NN = SharedScoreNet(
             num_assets=self.num_assets,
@@ -105,6 +115,38 @@ class MultiAssetGaussianDiffusion(nn.Module):
         # Fixed buffer of asset ids -- shape (N,), shared across batch.
         self.register_buffer("asset_ids", torch.arange(self.num_assets, dtype=torch.long))
 
+        # P1 graph-coupling modules. The residual fusion gamma starts at 0,
+        # so graph-enabled runs begin exactly at P0 behavior.
+        self.ablation_flags = AblationFlags.from_config(config)
+        relation_dim = getattr(config, "GRAPH_RELATION_DIM", 8)
+        graph_hidden_dim = getattr(config, "GRAPH_HIDDEN_DIM", 32)
+        edge_src, edge_dst, edge_relation_ids = self._build_graph_edges()
+        self.register_buffer("edge_src", edge_src)
+        self.register_buffer("edge_dst", edge_dst)
+        self.register_buffer("edge_relation_ids", edge_relation_ids)
+        self.relation_embedding = RelationEmbedding(
+            num_relation_types=max(1, self.asset_universe.num_relation_types),
+            relation_dim=relation_dim,
+        )
+        self.edge_weight_net = EdgeWeightNet(
+            stats_dim=4,
+            relation_dim=relation_dim,
+            hidden_dim=graph_hidden_dim,
+        )
+        self.message_fn = MessageFunction(
+            feature_dim=self.order_feature_dim,
+            hidden_dim=graph_hidden_dim,
+        )
+        self.aggregator = AttentionAggregator(
+            feature_dim=self.order_feature_dim,
+            hidden_dim=graph_hidden_dim,
+        )
+        self.noise_fusion = NoiseFusion(
+            feature_dim=self.order_feature_dim,
+            hidden_dim=graph_hidden_dim,
+            init_gamma=0.0,
+        )
+
         # Extension points for P2 / P3. Plain attributes (not nn.Module) so
         # that ablation toggles can swap them out without re-registering
         # parameters. Signature: hook(eps, x_t=..., t=..., **ctx) -> eps.
@@ -116,13 +158,81 @@ class MultiAssetGaussianDiffusion(nn.Module):
     # ---- P1 hook ---------------------------------------------------------
 
     def fuse(self, eps_local, **ctx):
-        """Per-step noise fusion across assets. In P0 this is identity.
+        """Per-step graph fusion across assets.
 
-        P1 will replace this method with a graph-coupling stack
-        (``rolling_stats`` -> ``edge_weight_net`` -> ``message_passing``
-        -> ``aggregator`` -> ``noise_fusion``).
+        With ``disable_graph=True`` this returns ``eps_local`` directly,
+        giving the P0 shared-backbone behavior bit-for-bit.
         """
-        return eps_local
+        if self.ablation_flags.disable_graph or self.edge_src.numel() == 0:
+            return eps_local
+
+        x_t = ctx["x_t"]
+        if x_t.shape[-1] != eps_local.shape[-1]:
+            raise ValueError(
+                "graph fusion expects x_t and eps_local to share the feature "
+                f"dimension, got {x_t.shape[-1]} and {eps_local.shape[-1]}"
+            )
+
+        raw_cond_orders = ctx.get("raw_cond_orders", None)
+        if raw_cond_orders is None:
+            raw_cond_orders = ctx.get("cond_orders", None)
+        if raw_cond_orders is None:
+            return eps_local
+        raw_cond_lob = ctx.get("raw_cond_lob", None)
+        if raw_cond_lob is None:
+            raw_cond_lob = ctx.get("cond_lob", None)
+
+        stats = compute_rolling_stats(raw_cond_orders, raw_cond_lob).to(
+            device=eps_local.device,
+            dtype=eps_local.dtype,
+        )
+        src = self.edge_src.to(eps_local.device)
+        dst = self.edge_dst.to(eps_local.device)
+        rel_ids = self.edge_relation_ids.to(eps_local.device)
+
+        stats_src = stats[:, src, :]
+        stats_dst = stats[:, dst, :]
+        relation_emb = self.relation_embedding(rel_ids).to(dtype=eps_local.dtype)
+        relation_emb = relation_emb.unsqueeze(0).expand(eps_local.shape[0], -1, -1)
+
+        edge_weights = self.edge_weight_net(stats_src, stats_dst, relation_emb)
+        if self.ablation_flags.freeze_edge_weights:
+            edge_weights = edge_weights.detach()
+
+        messages = self.message_fn(x_t[:, src, :, :], eps_local[:, src, :, :], edge_weights)
+        aggregated = self.aggregator(messages, x_t, src, dst, num_nodes=self.num_assets)
+        return self.noise_fusion(eps_local, aggregated)
+
+    @property
+    def graph_gamma(self):
+        return self.noise_fusion.gamma
+
+    def _build_graph_edges(self):
+        edges = list(self.asset_universe.directed_edges())
+        if not edges and self.num_assets > 1:
+            edges = [
+                (j, i)
+                for j in range(self.num_assets)
+                for i in range(self.num_assets)
+                if i != j
+            ]
+
+        src = []
+        dst = []
+        rel_ids = []
+        for j, i in edges:
+            src.append(j)
+            dst.append(i)
+            if (j, i) in self.asset_universe.relation_types:
+                rel_ids.append(self.asset_universe.relation_id(j, i))
+            else:
+                rel_ids.append(0)
+
+        return (
+            torch.tensor(src, dtype=torch.long),
+            torch.tensor(dst, dtype=torch.long),
+            torch.tensor(rel_ids, dtype=torch.long),
+        )
 
     # ---- forward (noising) process --------------------------------------
 
@@ -172,48 +282,113 @@ class MultiAssetGaussianDiffusion(nn.Module):
 
     # ---- sampling -------------------------------------------------------
 
-    def sample(self, x_0, real_cond_orders, real_cond_lob, weights):
+    def sample(
+        self,
+        x_0,
+        real_cond_orders,
+        real_cond_lob,
+        weights,
+        graph_cond_orders=None,
+        graph_cond_lob=None,
+    ):
         if self.sampling_type == "DDIM":
-            return self.ddim_sample(x_0, real_cond_orders, real_cond_lob)
-        return self.ddpm_sample(x_0, real_cond_orders, real_cond_lob, weights)
+            return self.ddim_sample(
+                x_0,
+                real_cond_orders,
+                real_cond_lob,
+                graph_cond_orders=graph_cond_orders,
+                graph_cond_lob=graph_cond_lob,
+            )
+        return self.ddpm_sample(
+            x_0,
+            real_cond_orders,
+            real_cond_lob,
+            weights,
+            graph_cond_orders=graph_cond_orders,
+            graph_cond_lob=graph_cond_lob,
+        )
 
-    def ddpm_sample(self, x_0, cond_orders, cond_lob, weights):
+    def ddpm_sample(self, x_0, cond_orders, cond_lob, weights,
+                    graph_cond_orders=None, graph_cond_lob=None):
         orig_cond_orders = cond_orders.detach().clone()
         orig_cond_lob = cond_lob.detach().clone() if cond_lob is not None else None
+        raw_cond_orders = (
+            graph_cond_orders.detach().clone()
+            if graph_cond_orders is not None else orig_cond_orders
+        )
+        raw_cond_lob = (
+            graph_cond_lob.detach().clone()
+            if graph_cond_lob is not None else orig_cond_lob
+        )
         t = torch.full(size=(x_0.shape[0],), fill_value=self.num_diffusionsteps - 1,
                        device=cst.DEVICE, dtype=torch.int64)
         x_t, noise = self.forward_reparametrized(x_0, t)
-        x_t_orig = x_t
         for _ in range(self.num_diffusionsteps - 1, -1, -1):
-            x_t_aug, cond_orders, cond_lob = self.augment(x_t, orig_cond_orders, orig_cond_lob)
-            x_t = self.ddpm_single_step(x_0, x_t_aug, x_t_orig, t, cond_orders, noise, weights, cond_lob)
+            x_t_aug, cond_orders_aug, cond_lob_aug = self.augment(x_t, orig_cond_orders, orig_cond_lob)
+            x_t = self.ddpm_single_step(
+                x_0,
+                x_t_aug,
+                x_t,
+                t,
+                cond_orders_aug,
+                noise,
+                weights,
+                cond_lob_aug,
+                raw_cond_orders=raw_cond_orders,
+                raw_cond_lob=raw_cond_lob,
+            )
             t = t - 1
         return x_t
 
-    def ddim_sample(self, x_0, cond_orders, cond_lob):
+    def ddim_sample(self, x_0, cond_orders, cond_lob,
+                    graph_cond_orders=None, graph_cond_lob=None):
         orig_cond_orders = cond_orders.detach().clone()
         orig_cond_lob = cond_lob.detach().clone() if cond_lob is not None else None
+        raw_cond_orders = (
+            graph_cond_orders.detach().clone()
+            if graph_cond_orders is not None else orig_cond_orders
+        )
+        raw_cond_lob = (
+            graph_cond_lob.detach().clone()
+            if graph_cond_lob is not None else orig_cond_lob
+        )
         tmp = torch.full(size=(x_0.shape[0],), fill_value=self.num_diffusionsteps - 1,
                          device=cst.DEVICE, dtype=torch.int64)
         x_t, _ = self.forward_reparametrized(x_0, tmp)
         time_steps = torch.flip(self.t, dims=(0,))
         for i, step in enumerate(time_steps):
-            x_t_aug, cond_orders, cond_lob = self.augment(x_t, orig_cond_orders, orig_cond_lob)
+            x_t_aug, cond_orders_aug, cond_lob_aug = self.augment(x_t, orig_cond_orders, orig_cond_lob)
             index = len(time_steps) - i - 1
             ts = x_t.new_full((x_0.shape[0],), step, dtype=torch.long)
-            x_t = self.ddim_single_step(x_t_aug, cond_lob, cond_orders, ts, index, x_t)
+            x_t = self.ddim_single_step(
+                x_t_aug,
+                cond_lob_aug,
+                cond_orders_aug,
+                ts,
+                index,
+                x_t,
+                raw_cond_orders=raw_cond_orders,
+                raw_cond_lob=raw_cond_lob,
+            )
         return x_t
 
-    def ddim_single_step(self, x_t_aug, cond_lob, cond_orders, ts, index, x_t):
+    def ddim_single_step(self, x_t_aug, cond_lob, cond_orders, ts, index, x_t,
+                         raw_cond_orders=None, raw_cond_lob=None):
         eps_local, v = self.NN(x_t_aug, cond_orders, ts, cond_lob, self.asset_ids)
         if self.IS_AUGMENTATION:
             eps_local, v = self.deaugment(eps_local, v)
         eps_local = self.pre_fusion_hook(eps_local, x_t=x_t, t=ts,
-                                         cond_orders=cond_orders, cond_lob=cond_lob)
+                                         cond_orders=cond_orders, cond_lob=cond_lob,
+                                         raw_cond_orders=raw_cond_orders,
+                                         raw_cond_lob=raw_cond_lob)
         eps_fused = self.fuse(eps_local, x_t=x_t, t=ts,
-                              cond_orders=cond_orders, cond_lob=cond_lob)
+                              cond_orders=cond_orders, cond_lob=cond_lob,
+                              raw_cond_orders=raw_cond_orders,
+                              raw_cond_lob=raw_cond_lob)
         eps_fused = self.post_fusion_hook(eps_fused, x_t=x_t, t=ts,
-                                          cond_orders=cond_orders, cond_lob=cond_lob)
+                                          cond_orders=cond_orders, cond_lob=cond_lob,
+                                          raw_cond_orders=raw_cond_orders,
+                                          raw_cond_lob=raw_cond_lob)
         alpha = self.ddim_alpha[index]
         alpha_prev = self.ddim_alpha_prev[index]
         sigma = self.ddim_sigma[index]
@@ -230,7 +405,8 @@ class MultiAssetGaussianDiffusion(nn.Module):
     # ---- one reverse DDPM step (training + eval) ------------------------
 
     def ddpm_single_step(self, x_0, x_t_aug, x_t, t, cond_orders, noise_true,
-                         weights, cond_lob, batch_idx=None):
+                         weights, cond_lob, batch_idx=None,
+                         raw_cond_orders=None, raw_cond_lob=None):
         B, N, K, F = x_0.shape
 
         beta_t = self.betas[t]
@@ -248,11 +424,17 @@ class MultiAssetGaussianDiffusion(nn.Module):
 
         # P2/P3 extension points + P1 fusion.
         eps_local = self.pre_fusion_hook(eps_local, x_t=x_t, t=t,
-                                         cond_orders=cond_orders, cond_lob=cond_lob)
+                                         cond_orders=cond_orders, cond_lob=cond_lob,
+                                         raw_cond_orders=raw_cond_orders,
+                                         raw_cond_lob=raw_cond_lob)
         eps_fused = self.fuse(eps_local, x_t=x_t, t=t,
-                              cond_orders=cond_orders, cond_lob=cond_lob)
+                              cond_orders=cond_orders, cond_lob=cond_lob,
+                              raw_cond_orders=raw_cond_orders,
+                              raw_cond_lob=raw_cond_lob)
         eps_fused = self.post_fusion_hook(eps_fused, x_t=x_t, t=t,
-                                          cond_orders=cond_orders, cond_lob=cond_lob)
+                                          cond_orders=cond_orders, cond_lob=cond_lob,
+                                          raw_cond_orders=raw_cond_orders,
+                                          raw_cond_lob=raw_cond_lob)
 
         # Variance head (same parametrization as single-asset).
         frac = (v + 1) / 2
