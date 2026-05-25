@@ -1,0 +1,76 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# === Virtual envs / package managers ===
+.venv/
+venv/
+env/
+.env
+.python-version
+
+# === Editors / OS ===
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# === ML artifacts: checkpoints, logs, runs ===
+wandb/
+lightning_logs/
+runs/
+output/
+outputs/
+logs/
+log/
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.npy
+*.npz
+checkpoints/
+
+# === Data ===
+# Large data files we do NOT sync; pull or regenerate on the box.
+data/
+ABIDES/log/
+ABIDES/log_paper/
+*.csv
+*.parquet
+*.feather
+*.arrow
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# === Docs / binaries we do not version ===
+*.pdf
+
+# === Project-specific (carried over from DeepMarket's .gitignore) ===
+trash/
+launch.sh
+launch_sim.sh
+generated_orders.csv
+real_orders.csv
+
+# === Backups from migration ===
+*.git.bak/

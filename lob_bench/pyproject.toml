@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lob-bench"
+version = "0.0.1"
+description = "Benchmarking library for generative models of Limit Order Book data"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+  { name = "Peer Nagy" }
+]
+
+dependencies = [
+  "chex==0.1.86",
+  "jax==0.4.35",
+  "jaxlob==0.19",
+  "matplotlib",
+  "numpy==2.2.4",
+  "pandas==2.2.3",
+  "plotly==5.22.0",
+  "scikit-learn==1.3.0",
+  "scipy==1.15.2",
+  "seaborn==0.13.2",
+  "statsmodels==0.14.0",
+  "tqdm==4.66.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/peernagy/lob_bench"
+Repository = "https://github.com/peernagy/lob_bench"
+
+[tool.setuptools]
+packages = ["lob_bench"]
+
+[tool.setuptools.package-dir]
+lob_bench = "."

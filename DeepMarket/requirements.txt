@@ -1,0 +1,22 @@
+einops
+ipython
+joblib
+lightning
+lion_pytorch
+matplotlib
+numpy
+pandas
+psutil
+python_dateutil
+scikit_learn
+scipy
+seaborn
+setuptools
+shapely
+tensorboard
+torch --index-url https://download.pytorch.org/whl/cu118
+torchvision --index-url https://download.pytorch.org/whl/cu118
+torch_ema
+tqdm
+wandb
+gdown
