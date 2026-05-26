@@ -1,16 +1,21 @@
-# AIQuant Workflow — Multi-Asset Graph-Coupled Diffusion (P0 + P1)
+# AIQuant Workflow — Multi-Asset Graph-Coupled Diffusion with Quasi-No-Arbitrage
 
-This document covers the implementation scope **before** quasi-no-arbitrage is
-introduced. It describes:
+This document covers the full method-side implementation plan across five
+phases:
 
-1. The problem we are solving in this scope.
+1. The problem we are solving.
 2. The model architecture and how it deviates from single-asset TRADES.
 3. The codebase layout — what is reused, what is added.
-4. A stepwise build plan: P0 (multi-asset shared backbone) → P1 (graph coupling).
+4. A stepwise build plan across phases:
+   - **P0** — multi-asset shared backbone (no cross-asset signal).
+   - **P1** — graph coupling inside the reverse diffusion step.
+   - **P2** — spread-aware conditioning (Layer 1 of quasi-no-arbitrage).
+   - **P3** — annealed energy guidance (Layer 2 of quasi-no-arbitrage).
+   - **P4** — Layer 3 posterior check + cross-asset evaluation metrics.
 
-P2 (spread-aware conditioning) and P3 (annealed energy guidance) are deferred
-and will be added to this document later. The code is designed so that those
-two stages plug in without touching what we build here.
+P0 and P1 form a self-contained multi-asset stack; P2/P3 plug in through two
+explicit hooks (`pre_fusion_hook`, `post_fusion_hook`) that we install in
+P0 and leave as no-ops until P2/P3.
 
 ---
 
@@ -53,23 +58,25 @@ Our model breaks this independence by making the per-step denoising of asset
 `i` depend on the current latent state and predicted noise of asset `j`,
 through a learned **state-dependent coupling**.
 
-### 1.3 What we are *not* doing in P0 + P1
+### 1.3 What we are *not* doing in this document
 
-- **No** explicit cross-asset constraints (spread, ETF–basket NAV gap,
-  arbitrage energy). Those are P2/P3.
 - **No** sparsification of the graph. With N = 2 the graph is fully connected
-  (2 directed edges).
+  (2 directed edges); we keep the dense code path and defer top-k / economic
+  sparsification to N > 2 work.
 - **No** multivariate-Hawkes / copula / ABIDES baselines yet. Those are P5.
+- **No** training-time arbitrage loss. The quasi-no-arbitrage mechanism in
+  P2/P3 is **inference-time** (conditioning + classifier-free-style guidance);
+  no extra loss term is added to the training objective.
 
-### 1.4 Success criteria for this scope
+### 1.4 Success criteria per phase
 
 | Stage | What "done" means                                                                              |
 | ----- | ---------------------------------------------------------------------------------------------- |
 | P0    | Multi-asset shared-backbone diffusion trains end-to-end, per-asset loss curves look like TRADES. |
 | P1    | Adding graph coupling: (a) loss does not regress; (b) ablation flag `disable_graph=True` recovers P0 exactly; (c) generated trajectories show non-trivial cross-asset correlation that the P0 baseline lacks. |
-
-Detailed metrics (lead–lag, cross-corr, etc.) live in P4 evaluation but we
-already need a coarse cross-correlation sanity check at the end of P1.
+| P2    | Spread conditioning runs only in the last K reverse steps; (a) `disable_spread_cond=True` recovers P1; (b) the generated spread distribution is closer to the historical one than P1's. |
+| P3    | Energy guidance is applied via `post_fusion_hook`; (a) `disable_arb_guidance=True` recovers P2; (b) the four-corner ablation grid runs; (c) persistent (long-duration) spread excursions are reduced vs. P2 without flattening the spread distribution to zero. |
+| P4    | Cross-asset metrics (corr matrix, CCF, lead–lag error, spillover) and Layer 3 posterior consistency check produce a JSON report comparing P0/P1/P2/P3 on held-out data. |
 
 ---
 
@@ -233,6 +240,205 @@ purely through the per-asset reconstruction gradient. If `γ` stays near zero
 through training, it is a signal that the graph is unhelpful and we should
 investigate before adding P2/P3.
 
+### 2.6 P2 — Spread-aware conditioning (Layer 1 of quasi-no-arbitrage)
+
+The cross-asset spread implied by the current noisy state is fed back into the
+denoiser as an auxiliary conditioning signal at the **next** reverse step,
+so the model is aware of its own evolving dislocation. Inference-time only —
+training-time inputs are unchanged.
+
+#### 2.6.1 Recovering a usable mid-price from `x_t`
+
+The mid-price is a property of the (clean) LOB state, not directly of the
+noisy latent. We use the standard one-shot estimate:
+
+```
+x̂_0^(i)(x_t, eps_fused) = ( x_t - sqrt(1-ᾱ_t) · eps_fused ) / sqrt(ᾱ_t)
+```
+
+From `x̂_0` (in the same space as `x_0`, i.e. order events with relative
+price `Δp`) and the conditioning LOB state `cond_lob`, we reconstruct a
+mid-price estimate `m̂_t^(i)`. Concretely: take the last LOB snapshot in
+`cond_lob`, apply the predicted `Δp` from `x̂_0` to it (using the same
+reverse mapping LOBSTER uses), and read off the new mid.
+
+Two caveats:
+- At high `t`, `eps_fused` is dominated by noise and `x̂_0` is unreliable.
+- The mid-price decode depends on the cond LOB state, which is fixed across
+  the reverse loop and so contributes no noise.
+
+Both are addressed by the activation schedule below.
+
+#### 2.6.2 Implied cross-asset spread
+
+For the ETF group `g = (E, {S_k})` with weights `ω_k`:
+
+```
+spread_t^(g) = m̂_t^(E) - Σ_k ω_k · m̂_t^(S_k)
+```
+
+For N = 2 this collapses to `m̂_t^(E) - ω · m̂_t^(S)` with one scalar `ω`.
+The weight is read from `AssetUniverse.etf_basket_weights`, which we declared
+in P0.1 with empty content and populate now.
+
+#### 2.6.3 Activation schedule
+
+```
+spread_inject_active(t) := (t < K_spread_steps)
+```
+
+Default `K_spread_steps = num_diffusionsteps // 4`. Above the threshold the
+spread feature is zero and the network sees a "no spread information" cond.
+This keeps both `x̂_0` and the energy gradient (P3) well-behaved at high noise.
+
+#### 2.6.4 Spread injection into the score net
+
+`shared_score_net` is extended to accept an optional scalar `spread_cond ∈ ℝ`
+(per group, broadcast to assets in the group):
+
+```
+shared_score_net(x_t, cond_orders, t, cond_lob, asset_id, spread_cond)
+                                                          ^^^^^^^^^^^
+                                                          new in P2
+```
+
+Internally, `spread_cond` is mapped through a small MLP (`ℝ → ℝ^{F_in}`) and
+**added** to the asset-embedding token introduced in P0.3. The TRADES
+backbone is untouched.
+
+#### 2.6.5 The pre_fusion_hook becomes non-trivial
+
+In `ma_gaussian_diffusion.py`:
+
+```
+def pre_fusion_hook(x_t, state):
+    if not spread_inject_active(t):
+        return None
+    x̂_0    = (x_t - sqrt(1-ᾱ_t) · state.last_eps_fused) / sqrt(ᾱ_t)
+    m̂      = decode_mid_price(x̂_0, cond_lob)
+    spread = compute_spread(m̂, asset_universe)
+    return spread
+```
+
+The returned spread is stored in `state` and used by the next step's
+`shared_score_net` call. On the very first reverse step there is no
+`last_eps_fused`, so spread is treated as zero.
+
+### 2.7 P3 — Annealed energy guidance (Layer 2 of quasi-no-arbitrage)
+
+A classifier-free-style guidance term whose strength is annealed across the
+reverse schedule and modulated by the prevailing market regime.
+
+#### 2.7.1 The energy function
+
+```
+E_arb(x_t) = Σ_g  ρ( |spread^(g)_t|, δ_dyn(t) )  ·  φ( τ^(g)_t )
+
+  ρ(u, δ) = max(0, u - δ)²                      — hinge-quadratic
+  φ(τ)    = τ                                    — linear, default
+  δ_dyn(t)= δ_base · (1 + κ · stress(x_t))      — state-dependent tolerance
+```
+
+`stress(x_t)` is a scalar derived from the P1 rolling-stats vector (high
+volatility / high cancellation rate ⇒ large stress ⇒ wider tolerance band).
+For the first cut: a small linear head over the same `rolling_stats` we
+already compute in P1, so there is no new feature-engineering cost.
+
+`δ_base` is calibrated **once** from the historical training set as the
+median `|spread|`. It is a non-trainable buffer.
+
+`κ` and `p` (in `λ(t)` below) are hyperparameters. Default `κ = 1.0`.
+
+#### 2.7.2 Persistence tracker `τ`
+
+`τ^(g)_t` counts consecutive reverse steps (down through `t`) for which
+group `g` has been outside its tolerance band. It is **state** carried across
+reverse steps:
+
+```
+class ReverseLoopState:
+    last_eps_fused: Tensor          # P2 already needs this
+    tau: Dict[group_id, int]        # P3 adds this
+```
+
+When `spread_inject_active(t)` is False (high noise), `tau` is held at 0;
+counting only begins when spread becomes meaningful.
+
+#### 2.7.3 Guidance schedule
+
+```
+λ(t) = λ_max · (1 - ᾱ_t)^p
+```
+
+Small at high noise, growing as `t → 0`. Default `λ_max = 1.0`, `p = 2`.
+
+#### 2.7.4 The post_fusion_hook becomes non-trivial
+
+```
+def post_fusion_hook(eps_fused, x_t, state):
+    if not arb_guidance_active(t):
+        return eps_fused
+    spread = state.last_spread                      # set by pre_fusion_hook
+    update_tau(state.tau, spread, δ_dyn(t))
+    E      = energy(spread, δ_dyn(t), state.tau)
+    grad   = autograd.grad(E, x_t, retain_graph=False)
+    return eps_fused + λ(t) · sqrt(1-ᾱ_t) · grad
+```
+
+Because `spread` is computed from `x_t` via `x̂_0` (which depends on
+`last_eps_fused`, treated as a constant for this gradient), `∇_{x_t} E_arb`
+flows only through the mid-price decoder — cheap, no backprop through the
+score net.
+
+For simplicity `arb_guidance_active(t) := spread_inject_active(t)` — guidance
+turns on at the same threshold as spread conditioning.
+
+#### 2.7.5 Ablation grid
+
+`disable_arb_guidance=True` ⇒ `post_fusion_hook` returns `eps_fused`
+unchanged. Combined with P1's `disable_graph` and P2's `disable_spread_cond`:
+
+| `disable_graph` | `disable_spread_cond` | `disable_arb_guidance` | Recovers           |
+| --------------- | --------------------- | ---------------------- | ------------------ |
+| T               | T                     | T                      | P0 (shared-only)   |
+| F               | T                     | T                      | P1 (graph)         |
+| F               | F                     | T                      | P2 (graph+cond)    |
+| F               | F                     | F                      | P3 (full)          |
+| T               | F                     | F                      | "arb without graph" — diagnostic |
+
+### 2.8 P4 — Layer 3 posterior check + cross-asset evaluation
+
+Layer 3 is a **diagnostic** on full generated trajectories; it does not
+modify generation. Cross-asset metrics live alongside it in
+`lob_bench/cross_asset/`.
+
+#### 2.8.1 Layer 3 posterior consistency check
+
+For each asset group `g` and each generated trajectory of length T:
+
+- Compute `spread^(g)_τ` for `τ = 1..T` in **wall-clock time** (not
+  diffusion steps).
+- Summary stats:
+  - mean and std of `|spread|`
+  - mean and tail (95%/99%) duration of excursions outside `δ_base`
+  - tail (top 1%, top 0.1%) of `|spread|`
+  - correlation of `|spread|` with rolling realized volatility
+- Compare against the same statistics on the historical training set.
+- Output: a JSON report + a boolean pass/fail per statistic at a configured
+  tolerance band.
+
+#### 2.8.2 Cross-asset metrics
+
+| Metric                | What it measures                                                  |
+| --------------------- | ----------------------------------------------------------------- |
+| Realized corr matrix  | Pearson corr of mid-price log-returns at a fixed sampling rate.   |
+| Cross-correlation fn  | `corr(r_t^(1), r_{t+ℓ}^(2))` over `ℓ ∈ [-L, L]`.                 |
+| Lead–lag error        | L2 distance between peak-lag location in real vs. generated CCF.  |
+| Conditional spillover | `E[ |r^(2)_{t+1}|  |  |r^(1)_t| > q ]` for high quantiles `q`.   |
+
+The cross-correlation sanity check from P1.9 graduates here to a proper
+metric.
+
 ---
 
 ## 3. Codebase Architecture
@@ -248,8 +454,8 @@ DeepMarket/
 ├── preprocessing/
 │   ├── LOBSTERDataBuilder.py               [unchanged]
 │   ├── LOBDataset.py                       [unchanged]   ← used by baseline (A)
-│   ├── AssetUniverse.py                    [NEW]
-│   └── MultiAssetLOBDataset.py             [NEW]
+│   ├── AssetUniverse.py                    [NEW] P0
+│   └── MultiAssetLOBDataset.py             [NEW] P0
 │
 ├── models/diffusers/
 │   ├── TRADES/                             [unchanged]
@@ -258,18 +464,39 @@ DeepMarket/
 │   │
 │   └── multi_asset/                        [NEW]
 │       ├── __init__.py
-│       ├── ma_diffusion_engine.py          [NEW] MultiAssetDiffusionEngine (Lightning)
-│       ├── ma_gaussian_diffusion.py        [NEW] reverse loop with graph hook
-│       ├── shared_score_net.py             [NEW] TRADES + asset embedding wrapper
-│       ├── ablation_flags.py               [NEW] disable_graph, freeze_edge_weights
-│       └── graph/
+│       ├── ma_diffusion_engine.py          [NEW] P0  MultiAssetDiffusionEngine (Lightning)
+│       ├── ma_gaussian_diffusion.py        [NEW] P0  reverse loop + pre/post fusion hooks
+│       ├── shared_score_net.py             [NEW] P0  TRADES + asset emb; P2 adds spread cond
+│       ├── ablation_flags.py               [NEW] P1  disable_graph/disable_spread_cond/disable_arb_guidance
+│       │
+│       ├── graph/                          [NEW in P1]
+│       │   ├── __init__.py
+│       │   ├── rolling_stats.py            [NEW] per-asset window statistics
+│       │   ├── relation_embedding.py       [NEW] r_{ji}
+│       │   ├── edge_weight_net.py          [NEW] w_{ji}(t)
+│       │   ├── message_passing.py          [NEW] f_φ
+│       │   ├── aggregator.py               [NEW] attention aggregation
+│       │   └── noise_fusion.py             [NEW] g_ψ with learnable γ
+│       │
+│       └── arbitrage/                      [NEW in P2/P3/P4]
 │           ├── __init__.py
-│           ├── rolling_stats.py            [NEW] per-asset window statistics
-│           ├── relation_embedding.py       [NEW] r_{ji}
-│           ├── edge_weight_net.py          [NEW] w_{ji}(t)
-│           ├── message_passing.py          [NEW] f_φ
-│           ├── aggregator.py               [NEW] attention aggregation
-│           └── noise_fusion.py             [NEW] g_ψ with learnable γ
+│           ├── reverse_loop_state.py       [NEW] P2  last_eps_fused, last_spread, tau
+│           ├── spread_computer.py          [NEW] P2  x̂_0 → mid-price → spread
+│           ├── activation_schedule.py      [NEW] P2  spread/guidance on-off threshold
+│           ├── persistence_tracker.py      [NEW] P3  τ update
+│           ├── energy.py                   [NEW] P3  ρ, φ, δ_dyn, stress(x_t)
+│           ├── guidance_schedule.py        [NEW] P3  λ(t)
+│           └── consistency_check.py        [NEW] P4  Layer 3 diagnostic
+│
+└── evaluation/quantitative_eval/
+    └── posterior_report.py                 [NEW] P4  driver that runs consistency_check + emits JSON
+
+lob_bench/cross_asset/                      [NEW in P4]
+├── __init__.py
+├── cross_corr.py                           [NEW] P1.9 sanity → P4 metric
+├── lead_lag.py                             [NEW] P4
+├── arbitrage_metrics.py                    [NEW] P4
+└── spillover.py                            [NEW] P4 (optional)
 ```
 
 ### 3.2 Files we deliberately do **not** touch in P0/P1
@@ -283,24 +510,21 @@ DeepMarket/
 The multi-asset stack is parallel to the existing single-asset stack, not a
 modification of it.
 
-### 3.3 Where P2/P3 will plug in later (placeholders, do not create yet)
+### 3.3 Extension points
 
-```
-models/diffusers/multi_asset/arbitrage/
-    spread_computer.py
-    energy.py
-    persistence_tracker.py
-    guidance_schedule.py
-    consistency_check.py
-```
+The multi-asset diffuser exposes two hooks that are no-ops in P0/P1 and gain
+behavior in P2/P3:
 
-These will hook into `ma_gaussian_diffusion.py` at two explicit extension
-points we will create up front:
+- `pre_fusion_hook(x_t, state) → spread` — wired in P2 to compute the
+  implied cross-asset spread from `x̂_0` and inject it into the next
+  `shared_score_net` call.
+- `post_fusion_hook(eps_fused, x_t, state) → eps_guided` — wired in P3 to
+  add the energy-gradient guidance term.
 
-- `pre_fusion_hook(x_t, eps_local, ...)` — for spread injection (P2).
-- `post_fusion_hook(eps_fused, x_t, ...)` — for energy guidance (P3).
-
-Both hooks are no-ops in P0/P1.
+A small `ReverseLoopState` dataclass (`arbitrage/reverse_loop_state.py`)
+carries `last_eps_fused`, `last_spread`, and `tau` between reverse steps;
+P0/P1 only use the `last_eps_fused` field (and only because it costs
+nothing).
 
 ---
 
@@ -439,18 +663,215 @@ it before moving on. Steps are listed in execution order.
 > convergence, ablation toggle reproduces P0, and the cross-correlation
 > sanity metric prefers P1 over P0 on held-out windows.
 
+### Phase P2 — Spread-aware conditioning
+
+P2 is **inference-time only**. Training does not change; we only modify the
+sampling path. The model trained in P1 can be re-used for P2 evaluation
+without retraining, though we will also train a fresh P2 model where
+`spread_cond` is dropped out (cond_dropout-style) so the network learns to
+use it.
+
+**Step P2.1 — Reverse loop state**
+- File: `models/diffusers/multi_asset/arbitrage/reverse_loop_state.py`
+- Dataclass `ReverseLoopState` with fields `last_eps_fused`, `last_spread`,
+  `tau` (dict). Built once per generation batch and updated in-place across
+  reverse steps.
+- Verify: round-trip construction + update, no allocation in inner loop.
+
+**Step P2.2 — Spread computer**
+- File: `models/diffusers/multi_asset/arbitrage/spread_computer.py`
+- Two functions:
+  - `decode_mid_price(x̂_0, cond_lob) -> (B, N)` — apply the predicted
+    `Δp` from `x̂_0` to the last LOB snapshot to estimate the new mid.
+    Reuses the inverse normalization that `LOBSTERDataBuilder` uses
+    forward.
+  - `compute_spread(mid, asset_universe) -> (B, num_groups)` — for each
+    group, `mid_E - Σ ω_k · mid_{S_k}`.
+- Verify: at `x̂_0 = x_0` ground truth, recovered mid matches the LOB
+  snapshot's mid up to LOBSTER tick rounding; spread on real data has the
+  same magnitude as a manual reference calculation.
+
+**Step P2.3 — Activation schedule**
+- File: `models/diffusers/multi_asset/arbitrage/activation_schedule.py`
+- `spread_inject_active(t, num_diffusionsteps, K_spread_steps)`
+- Default `K_spread_steps = num_diffusionsteps // 4`.
+- Verify: returns False above threshold, True below.
+
+**Step P2.4 — Extend `shared_score_net` with `spread_cond` input**
+- File: `models/diffusers/multi_asset/shared_score_net.py` (extend)
+- Add optional `spread_cond: (B, N) or None`. When `None`, behavior is
+  bit-identical to P1. When provided, route through a small MLP
+  (`ℝ → ℝ^{F_in}`) and add to the asset-embedding token.
+- Verify: `spread_cond=None` path matches P1 outputs exactly; non-`None`
+  path produces a different output. Gradient flows back to the new MLP.
+
+**Step P2.5 — Wire `pre_fusion_hook`**
+- File: `models/diffusers/multi_asset/ma_gaussian_diffusion.py` (extend)
+- Replace the no-op `pre_fusion_hook` with the body from §2.6.5.
+- On step T (first reverse step), spread is treated as 0 (no
+  `last_eps_fused` yet).
+- Verify: with `disable_spread_cond=True`, the path is bit-identical to
+  P1; with it False, the path differs only after step `num_diffusionsteps - K_spread_steps`.
+
+**Step P2.6 — Ablation flag**
+- File: `models/diffusers/multi_asset/ablation_flags.py` (extend)
+- Add `disable_spread_cond: bool`. When True, `pre_fusion_hook` returns
+  `None` regardless of `t`.
+- Verify: with flag set, P1 outputs are reproduced exactly.
+
+**Step P2.7 — Optional: retrain with spread-cond dropout**
+- Change in `ma_diffusion_engine.py`: during training, occasionally feed
+  `spread_cond` computed from the *training* ground truth (with prob
+  `1 - cond_dropout_prob`) and zero otherwise.
+- Without this step, P2 still works at inference but the network has not
+  learned to use `spread_cond` informatively — useful as an ablation
+  ("P2 without retraining") but not as the main P2 result.
+- Verify: per-asset loss at convergence is within noise of P1's.
+
+**Step P2.8 — Sanity check: generated spread distribution**
+- Quick script in `evaluation/quantitative_eval/` (no new metric file
+  needed yet — that comes in P4).
+- Compare KDE of generated `|spread|` from P1 vs. P2 vs. real, on a
+  held-out window.
+- Verify: P2's KDE is visually closer to real than P1's; means and tails
+  in the same order.
+
+> **P2 exit criterion**: P2.8 prefers P2 over P1, ablation toggle exactly
+> reproduces P1, and the spread-conditioning code path costs less than 10%
+> additional wall-time per reverse step (since it activates only in the
+> last K).
+
+### Phase P3 — Annealed energy guidance
+
+Also **inference-time only**. Same trained weights as P2 are used.
+
+**Step P3.1 — Persistence tracker**
+- File: `models/diffusers/multi_asset/arbitrage/persistence_tracker.py`
+- `update_tau(state.tau, spread, delta_dyn)`: for each group, if
+  `|spread^(g)| > δ_dyn^(g)`, increment `tau[g]`; else reset to 0.
+- Resets `tau` to 0 when `spread_inject_active(t)` is False.
+- Verify: a synthetic spread sequence produces the expected `τ` trajectory
+  (e.g., spread spike of length 5 ⇒ `τ` hits 5 and resets).
+
+**Step P3.2 — Energy function**
+- File: `models/diffusers/multi_asset/arbitrage/energy.py`
+- `rho(u, delta) = relu(u - delta) ** 2`
+- `phi(tau) = tau` (default, linear; signature kept so we can swap in a
+  monotone schedule later)
+- `delta_dyn(t, rolling_stats, delta_base, kappa) = delta_base * (1 + kappa * stress)`,
+  with `stress` a small linear head over `rolling_stats`.
+- `energy(spread, delta_dyn, tau) = Σ_g rho(|spread^(g)|, delta_dyn^(g)) * phi(tau^(g))`
+- `delta_base` is a calibrated buffer — populate from training-set median
+  `|spread|` on first instantiation and persist with the checkpoint.
+- Verify: gradient w.r.t. spread is zero inside the tolerance band; nonzero
+  and quadratic outside.
+
+**Step P3.3 — Guidance schedule**
+- File: `models/diffusers/multi_asset/arbitrage/guidance_schedule.py`
+- `lambda(t, alpha_bar, lambda_max, p) = lambda_max * (1 - alpha_bar_t) ** p`
+- Default `lambda_max = 1.0`, `p = 2`.
+- Verify: monotone decreasing in `ᾱ_t` (so increasing in noise level
+  removed — i.e. smaller at high `t`).
+
+**Step P3.4 — Wire `post_fusion_hook`**
+- File: `models/diffusers/multi_asset/ma_gaussian_diffusion.py` (extend)
+- Replace the no-op `post_fusion_hook` with the body from §2.7.4.
+- Important: `x_t.requires_grad_(True)` for the duration of the spread
+  computation and energy gradient, then detach for the standard DDPM update.
+- `state.last_spread` must be set by `pre_fusion_hook` before this hook fires.
+- Verify: at the four ablation corners (see §2.7.5), behavior matches
+  expectations bit-by-bit for the three "disable" combinations.
+
+**Step P3.5 — Ablation flag**
+- File: `models/diffusers/multi_asset/ablation_flags.py` (extend)
+- Add `disable_arb_guidance: bool`. When True, `post_fusion_hook` returns
+  `eps_fused` unchanged.
+- Verify: with flag True, P2 outputs are reproduced exactly.
+
+**Step P3.6 — Sanity check: spread persistence distribution**
+- Compare the empirical distribution of excursion durations
+  (`|spread| > δ_base`) across P1, P2, P3, and real.
+- Verify: P3 reduces long-tail excursions relative to P2, while the bulk of
+  the spread distribution (small/short excursions) is preserved.
+
+> **P3 exit criterion**: ablation grid runs cleanly, tail of excursion
+> durations is reduced vs. P2 without collapsing the central spread
+> distribution, and the four-corner table from §2.7.5 is produced as a
+> diagnostic.
+
+### Phase P4 — Layer 3 posterior check + cross-asset evaluation
+
+**Step P4.1 — Layer 3 consistency check**
+- File: `models/diffusers/multi_asset/arbitrage/consistency_check.py`
+- Input: a generated trajectory (`(T, N, ...)` of orders+LOB),
+  AssetUniverse, and a reference statistic set computed once from training
+  data.
+- Output: dict of summary stats (see §2.8.1) and pass/fail booleans.
+- Verify: on real data, all stats pass; on a degenerate trajectory
+  (`spread ≡ 0`), at least the variance and tail stats fail.
+
+**Step P4.2 — Cross-correlation metric**
+- File: `lob_bench/cross_asset/cross_corr.py`
+- Functions:
+  - `realized_corr(returns_1, returns_2, dt) -> float`
+  - `ccf(returns_1, returns_2, max_lag) -> ndarray`
+- Mid-price returns are sampled at a configurable bar size.
+- Verify: white-noise inputs produce ~0 corr and a flat CCF; a lagged
+  copy produces the expected peak.
+
+**Step P4.3 — Lead-lag error**
+- File: `lob_bench/cross_asset/lead_lag.py`
+- `lead_lag_error(real_ccf, gen_ccf) -> float` — L2 (or peak-position
+  L1) between peak-lag locations.
+- Verify: on identical inputs returns 0; on inputs with shifted peaks
+  returns the shift.
+
+**Step P4.4 — Arbitrage metrics**
+- File: `lob_bench/cross_asset/arbitrage_metrics.py`
+- Aggregates: empirical distribution of `spread` (KS distance vs. real),
+  excursion-duration tail, conditional-on-stress spread mean.
+- Verify: on real-vs-real (different windows of the same data) the KS
+  statistic is small; on real-vs-shuffled the statistic is large.
+
+**Step P4.5 — Spillover (optional)**
+- File: `lob_bench/cross_asset/spillover.py`
+- `E[|r^(2)_{t+1}| | |r^(1)_t| > q]` at a few high quantiles `q`.
+- Verify: returns a finite number on real data; spillover on shuffled
+  data is approximately the unconditional mean.
+
+**Step P4.6 — Posterior report driver**
+- File: `DeepMarket/evaluation/quantitative_eval/posterior_report.py`
+- Wires P4.1 + P4.2 + P4.3 + P4.4 (+ optionally P4.5) into a single
+  evaluation pass. Runs once per ablation-corner checkpoint (P0/P1/P2/P3
+  + the diagnostic "arb without graph"). Emits a JSON report.
+- Verify: report compiles for at least one full corner end-to-end on a
+  small held-out window.
+
+> **P4 exit criterion**: the JSON report compares all four ablation
+> corners (plus real-data reference values) across all four metric
+> groups, and the trends match the per-phase exit criteria (P1 > P0 in
+> corr, P2 > P1 in spread distribution closeness, P3 > P2 in excursion
+> tails).
+
 ---
 
 ## 5. Open Items / Deferred
 
-- **Mid-price extraction from `x_t`** — needed by P2 (spread conditioning)
-  and P3 (energy gradient). Agreed approach: use `x̂_0` reconstructed from
-  the current noise estimate; only activate spread/energy in the last K
-  reverse steps (small t). To be detailed in this document when P2 starts.
 - **Score-net sharing strategy** — currently fully shared backbone +
   `asset_emb`. If marginal realism on the ETF vs. the constituent diverges
   noticeably in P0 evaluation, revisit by adding per-asset-class output
   heads.
+- **`φ(τ)` shape** — defaulting to linear in P3. If the excursion-tail
+  reduction in P3.6 is too aggressive (collapses the central spread
+  distribution), swap to a soft-plus or capped variant.
+- **`K_spread_steps`, `λ_max`, `p`, `κ` tuning** — set at first-cut defaults
+  in §2.6.3 / §2.7. Sweep only if P2/P3 exit criteria are missed.
+- **Calibration of `δ_base`** — currently the training-set median `|spread|`.
+  Per-regime `δ_base` (e.g. higher in stressed regimes) is a possible
+  extension if `δ_dyn(t)`'s state modulation is insufficient.
 - **N > 2 sparsification** — economic-prior + top-k. Not needed at N = 2.
-- **Baselines (B/C/D)** — copula post-hoc, Hawkes, ABIDES. Decide after P1
+- **Baselines (B/C/D)** — copula post-hoc, Hawkes, ABIDES. Decide after P3
   results.
+- **DDIM port of the pre/post-fusion hooks** — P0–P3 currently target DDPM
+  sampling. Porting the same hooks to `ddim_single_step` is straightforward
+  but deferred until DDPM results are in.

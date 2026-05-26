@@ -17,6 +17,8 @@ class AblationFlags:
         Skip graph message passing and return the local score estimate exactly.
     freeze_edge_weights:
         Stop gradients from flowing through relation embeddings and edge MLP.
+    disable_spread_cond:
+        Skip P2 spread conditioning and call the score net exactly as P1 did.
     disable_arb_guidance:
         Reserved for P3. Present now so config files do not need another
         migration when arbitrage guidance is added.
@@ -24,6 +26,7 @@ class AblationFlags:
 
     disable_graph: bool = False
     freeze_edge_weights: bool = False
+    disable_spread_cond: bool = False
     disable_arb_guidance: bool = False
 
     @classmethod
@@ -36,6 +39,7 @@ class AblationFlags:
             return cls(
                 disable_graph=bool(structured.get("disable_graph", False)),
                 freeze_edge_weights=bool(structured.get("freeze_edge_weights", False)),
+                disable_spread_cond=bool(structured.get("disable_spread_cond", False)),
                 disable_arb_guidance=bool(structured.get("disable_arb_guidance", False)),
             )
 
@@ -46,11 +50,13 @@ class AblationFlags:
             return cls(
                 disable_graph=bool(legacy.get("disable_graph", False)),
                 freeze_edge_weights=bool(legacy.get("freeze_edge_weights", False)),
+                disable_spread_cond=bool(legacy.get("disable_spread_cond", False)),
                 disable_arb_guidance=bool(legacy.get("disable_arb_guidance", False)),
             )
 
         return cls(
             disable_graph=bool(getattr(config, "DISABLE_GRAPH", False)),
             freeze_edge_weights=bool(getattr(config, "FREEZE_EDGE_WEIGHTS", False)),
+            disable_spread_cond=bool(getattr(config, "DISABLE_SPREAD_COND", False)),
             disable_arb_guidance=bool(getattr(config, "DISABLE_ARB_GUIDANCE", False)),
         )

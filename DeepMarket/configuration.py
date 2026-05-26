@@ -46,9 +46,15 @@ class Configuration:
         self.ASSET_UNIVERSE: AssetUniverse | None = None
         self.DISABLE_GRAPH = False
         self.FREEZE_EDGE_WEIGHTS = False
+        self.DISABLE_SPREAD_COND = False
         self.DISABLE_ARB_GUIDANCE = False
         self.GRAPH_RELATION_DIM = 8
         self.GRAPH_HIDDEN_DIM = 32
+        self.K_SPREAD_STEPS = None
+        self.SPREAD_PRICE_FEATURE_INDEX = None
+        self.SPREAD_PRICE_IS_DELTA = True
+        self.TRAIN_WITH_SPREAD_COND = False
+        self.SPREAD_COND_DROPOUT_PROB = 0.0
 
         self.WANDB_INSTANCE = None
         self.WANDB_RUN_NAME = None

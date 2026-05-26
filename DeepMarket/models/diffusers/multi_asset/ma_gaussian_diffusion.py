@@ -2,9 +2,9 @@
 :class:`models.diffusers.gaussian_diffusion.GaussianDiffusion`.
 
 All tensors carry a leading ``(B, N, ...)`` shape. P0 keeps the per-asset
-denoising fully independent: ``fuse`` is identity and the two hooks
-``pre_fusion_hook`` / ``post_fusion_hook`` are no-ops. P1 replaces ``fuse``
-with a graph stack; P2 / P3 plug into the hooks.
+denoising fully independent: ``fuse`` is identity. P1 replaces ``fuse`` with
+a graph stack. P2 computes spread conditioning in ``pre_fusion_hook`` during
+sampling; P3 will add energy guidance in ``post_fusion_hook``.
 
 Loss policy: each asset contributes a hybrid (L_simple + lambda * L_vlb)
 loss; the per-asset scalars are *summed* across assets so the batch-level
@@ -20,6 +20,13 @@ from torch import nn
 import constants as cst
 from constants import LearningHyperParameter
 from models.diffusers.multi_asset.ablation_flags import AblationFlags
+from models.diffusers.multi_asset.arbitrage import (
+    ReverseLoopState,
+    broadcast_spread_to_assets,
+    compute_spread,
+    decode_mid_price,
+    spread_inject_active,
+)
 from models.diffusers.multi_asset.graph import (
     AttentionAggregator,
     EdgeWeightNet,
@@ -147,10 +154,16 @@ class MultiAssetGaussianDiffusion(nn.Module):
             init_gamma=0.0,
         )
 
-        # Extension points for P2 / P3. Plain attributes (not nn.Module) so
-        # that ablation toggles can swap them out without re-registering
-        # parameters. Signature: hook(eps, x_t=..., t=..., **ctx) -> eps.
-        self.pre_fusion_hook = _identity_hook
+        # P2 spread-conditioning controls. ``K_SPREAD_STEPS=None`` maps to
+        # the default final quarter of the reverse schedule.
+        self.k_spread_steps = getattr(config, "K_SPREAD_STEPS", None)
+        self.spread_price_feature_index = getattr(config, "SPREAD_PRICE_FEATURE_INDEX", None)
+        self.spread_price_is_delta = bool(getattr(config, "SPREAD_PRICE_IS_DELTA", True))
+
+        # Extension points for P2 / P3. ``pre_fusion_hook`` computes the
+        # spread condition before the score-net call; ``post_fusion_hook``
+        # remains the P3 no-op for now.
+        self.pre_fusion_hook = self._spread_pre_fusion_hook
         self.post_fusion_hook = _identity_hook
 
         self.init_losses()
@@ -233,6 +246,96 @@ class MultiAssetGaussianDiffusion(nn.Module):
             torch.tensor(dst, dtype=torch.long),
             torch.tensor(rel_ids, dtype=torch.long),
         )
+
+    # ---- P2 spread conditioning ----------------------------------------
+
+    def _spread_pre_fusion_hook(self, x_t, state=None, t=None, cond_lob=None, **_ctx):
+        """Compute the spread condition consumed by the next score-net call."""
+        if (
+            state is None
+            or self.ablation_flags.disable_spread_cond
+            or cond_lob is None
+            or not self.asset_universe.etf_basket_weights
+        ):
+            if state is not None:
+                state.update_spread(None)
+            return None
+
+        if t is None:
+            raise ValueError("t is required for spread conditioning")
+
+        active = spread_inject_active(
+            t,
+            num_diffusionsteps=self.num_diffusionsteps,
+            k_spread_steps=self.k_spread_steps,
+        )
+        if torch.is_tensor(active):
+            active = active.to(device=x_t.device)
+            if not bool(active.any().item()):
+                state.update_spread(None)
+                return None
+        elif not active:
+            state.update_spread(None)
+            return None
+
+        if state.last_eps_fused is None:
+            num_groups = len(self.asset_universe.etf_basket_weights)
+            spread = x_t.new_zeros(x_t.shape[0], num_groups)
+        else:
+            x0_hat = self._predict_x0_from_eps(x_t, state.last_eps_fused, t)
+            mid = decode_mid_price(
+                x0_hat,
+                cond_lob,
+                price_feature_index=self.spread_price_feature_index,
+                price_is_delta=self.spread_price_is_delta,
+            )
+            spread = compute_spread(mid, self.asset_universe)
+
+        if spread.shape[1] == 0:
+            state.update_spread(None)
+            return None
+        if torch.is_tensor(active):
+            spread = spread * active.to(dtype=spread.dtype).view(-1, 1)
+
+        state.update_spread(spread)
+        return broadcast_spread_to_assets(spread, self.asset_universe, self.num_assets)
+
+    def _predict_x0_from_eps(self, x_t, eps_fused, t):
+        """One-shot clean estimate used by the spread decoder."""
+        if eps_fused.shape != x_t.shape:
+            raise ValueError(
+                "eps_fused must have same shape as x_t for spread decoding: "
+                f"{tuple(eps_fused.shape)} vs {tuple(x_t.shape)}"
+            )
+        alpha_bar = self.alphas_cumprod[t].to(device=x_t.device, dtype=x_t.dtype)
+        view_shape = (x_t.shape[0],) + (1,) * (x_t.dim() - 1)
+        alpha_bar = alpha_bar.view(view_shape)
+        sqrt_alpha_bar = torch.sqrt(alpha_bar).clamp_min(1e-12)
+        sqrt_one_minus = torch.sqrt((1.0 - alpha_bar).clamp_min(0.0))
+        return (x_t - sqrt_one_minus * eps_fused) / sqrt_alpha_bar
+
+    def training_spread_cond(self, x_0, cond_lob, dropout_prob: float = 0.0):
+        """Optional P2.7 ground-truth spread condition for fresh P2 training."""
+        if (
+            self.ablation_flags.disable_spread_cond
+            or cond_lob is None
+            or not self.asset_universe.etf_basket_weights
+        ):
+            return None
+        mid = decode_mid_price(
+            x_0,
+            cond_lob,
+            price_feature_index=self.spread_price_feature_index,
+            price_is_delta=self.spread_price_is_delta,
+        )
+        spread = compute_spread(mid, self.asset_universe)
+        if spread.shape[1] == 0:
+            return None
+        spread_cond = broadcast_spread_to_assets(spread, self.asset_universe, self.num_assets)
+        if dropout_prob > 0.0:
+            keep = torch.rand(spread_cond.shape[0], 1, device=spread_cond.device) >= dropout_prob
+            spread_cond = spread_cond * keep.to(dtype=spread_cond.dtype)
+        return spread_cond
 
     # ---- forward (noising) process --------------------------------------
 
@@ -323,7 +426,14 @@ class MultiAssetGaussianDiffusion(nn.Module):
         t = torch.full(size=(x_0.shape[0],), fill_value=self.num_diffusionsteps - 1,
                        device=cst.DEVICE, dtype=torch.int64)
         x_t, noise = self.forward_reparametrized(x_0, t)
+        state = ReverseLoopState()
         for _ in range(self.num_diffusionsteps - 1, -1, -1):
+            spread_cond = self.pre_fusion_hook(
+                x_t=x_t,
+                state=state,
+                t=t,
+                cond_lob=raw_cond_lob,
+            )
             x_t_aug, cond_orders_aug, cond_lob_aug = self.augment(x_t, orig_cond_orders, orig_cond_lob)
             x_t = self.ddpm_single_step(
                 x_0,
@@ -336,6 +446,8 @@ class MultiAssetGaussianDiffusion(nn.Module):
                 cond_lob_aug,
                 raw_cond_orders=raw_cond_orders,
                 raw_cond_lob=raw_cond_lob,
+                spread_cond=spread_cond,
+                reverse_state=state,
             )
             t = t - 1
         return x_t
@@ -355,11 +467,18 @@ class MultiAssetGaussianDiffusion(nn.Module):
         tmp = torch.full(size=(x_0.shape[0],), fill_value=self.num_diffusionsteps - 1,
                          device=cst.DEVICE, dtype=torch.int64)
         x_t, _ = self.forward_reparametrized(x_0, tmp)
+        state = ReverseLoopState()
         time_steps = torch.flip(self.t, dims=(0,))
         for i, step in enumerate(time_steps):
-            x_t_aug, cond_orders_aug, cond_lob_aug = self.augment(x_t, orig_cond_orders, orig_cond_lob)
             index = len(time_steps) - i - 1
             ts = x_t.new_full((x_0.shape[0],), step, dtype=torch.long)
+            spread_cond = self.pre_fusion_hook(
+                x_t=x_t,
+                state=state,
+                t=ts,
+                cond_lob=raw_cond_lob,
+            )
+            x_t_aug, cond_orders_aug, cond_lob_aug = self.augment(x_t, orig_cond_orders, orig_cond_lob)
             x_t = self.ddim_single_step(
                 x_t_aug,
                 cond_lob_aug,
@@ -369,18 +488,24 @@ class MultiAssetGaussianDiffusion(nn.Module):
                 x_t,
                 raw_cond_orders=raw_cond_orders,
                 raw_cond_lob=raw_cond_lob,
+                spread_cond=spread_cond,
+                reverse_state=state,
             )
         return x_t
 
     def ddim_single_step(self, x_t_aug, cond_lob, cond_orders, ts, index, x_t,
-                         raw_cond_orders=None, raw_cond_lob=None):
-        eps_local, v = self.NN(x_t_aug, cond_orders, ts, cond_lob, self.asset_ids)
+                         raw_cond_orders=None, raw_cond_lob=None,
+                         spread_cond=None, reverse_state=None):
+        eps_local, v = self.NN(
+            x_t_aug,
+            cond_orders,
+            ts,
+            cond_lob,
+            self.asset_ids,
+            spread_cond=spread_cond,
+        )
         if self.IS_AUGMENTATION:
             eps_local, v = self.deaugment(eps_local, v)
-        eps_local = self.pre_fusion_hook(eps_local, x_t=x_t, t=ts,
-                                         cond_orders=cond_orders, cond_lob=cond_lob,
-                                         raw_cond_orders=raw_cond_orders,
-                                         raw_cond_lob=raw_cond_lob)
         eps_fused = self.fuse(eps_local, x_t=x_t, t=ts,
                               cond_orders=cond_orders, cond_lob=cond_lob,
                               raw_cond_orders=raw_cond_orders,
@@ -388,7 +513,10 @@ class MultiAssetGaussianDiffusion(nn.Module):
         eps_fused = self.post_fusion_hook(eps_fused, x_t=x_t, t=ts,
                                           cond_orders=cond_orders, cond_lob=cond_lob,
                                           raw_cond_orders=raw_cond_orders,
-                                          raw_cond_lob=raw_cond_lob)
+                                          raw_cond_lob=raw_cond_lob,
+                                          state=reverse_state)
+        if reverse_state is not None:
+            reverse_state.update_eps(eps_fused)
         alpha = self.ddim_alpha[index]
         alpha_prev = self.ddim_alpha_prev[index]
         sigma = self.ddim_sigma[index]
@@ -406,7 +534,8 @@ class MultiAssetGaussianDiffusion(nn.Module):
 
     def ddpm_single_step(self, x_0, x_t_aug, x_t, t, cond_orders, noise_true,
                          weights, cond_lob, batch_idx=None,
-                         raw_cond_orders=None, raw_cond_lob=None):
+                         raw_cond_orders=None, raw_cond_lob=None,
+                         spread_cond=None, reverse_state=None):
         B, N, K, F = x_0.shape
 
         beta_t = self.betas[t]
@@ -416,17 +545,21 @@ class MultiAssetGaussianDiffusion(nn.Module):
         alpha_t = repeat(alpha_t, "b -> b n l d", n=N, l=K, d=F)
         alpha_cumprod_t = repeat(alpha_cumprod_t, "b -> b n l d", n=N, l=K, d=F)
 
-        eps_local, v = self.NN(x_t_aug, cond_orders, t, cond_lob, self.asset_ids)
+        eps_local, v = self.NN(
+            x_t_aug,
+            cond_orders,
+            t,
+            cond_lob,
+            self.asset_ids,
+            spread_cond=spread_cond,
+        )
         if self.IS_AUGMENTATION:
             eps_local, v = self.deaugment(eps_local, v)
         if torch.isnan(eps_local).any():
             print("eps_local:", eps_local.max())
 
-        # P2/P3 extension points + P1 fusion.
-        eps_local = self.pre_fusion_hook(eps_local, x_t=x_t, t=t,
-                                         cond_orders=cond_orders, cond_lob=cond_lob,
-                                         raw_cond_orders=raw_cond_orders,
-                                         raw_cond_lob=raw_cond_lob)
+        # P2 spread conditioning is injected into the score-net call above;
+        # P1 graph fusion and the P3 post-fusion hook operate on eps here.
         eps_fused = self.fuse(eps_local, x_t=x_t, t=t,
                               cond_orders=cond_orders, cond_lob=cond_lob,
                               raw_cond_orders=raw_cond_orders,
@@ -434,7 +567,10 @@ class MultiAssetGaussianDiffusion(nn.Module):
         eps_fused = self.post_fusion_hook(eps_fused, x_t=x_t, t=t,
                                           cond_orders=cond_orders, cond_lob=cond_lob,
                                           raw_cond_orders=raw_cond_orders,
-                                          raw_cond_lob=raw_cond_lob)
+                                          raw_cond_lob=raw_cond_lob,
+                                          state=reverse_state)
+        if reverse_state is not None:
+            reverse_state.update_eps(eps_fused)
 
         # Variance head (same parametrization as single-asset).
         frac = (v + 1) / 2

@@ -77,5 +77,6 @@ real_orders.csv
 
 # === Local Claude context (personal, do not sync) ===
 CLAUDE.md
+AGENTS.md
 .claude/
 midterm_report.txt

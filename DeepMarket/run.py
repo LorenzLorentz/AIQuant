@@ -42,6 +42,7 @@ def _build_asset_universe(config: Configuration) -> AssetUniverse:
         return AssetUniverse(
             assets=tickers,
             relation_types={(0, 1): 0, (1, 0): 1},
+            etf_basket_weights={0: {1: 1.0}},
         )
     # General N: full directed graph minus self loops, each edge a distinct
     # relation type. Sufficient for P0; P1 will revisit when N > 2 lands.
@@ -323,4 +324,4 @@ def print_setup(config: Configuration):
         print("Discriminator num FC layers: ", config.HYPER_PARAMETERS[cst.LearningHyperParameter.DISCRIMINATOR_NUM_FC_LAYERS])
         print("Discriminator num conv layers: ", config.HYPER_PARAMETERS[cst.LearningHyperParameter.DISCRIMINATOR_NUM_CONV_LAYERS])
         print("Discriminator kernel size: ", config.HYPER_PARAMETERS[cst.LearningHyperParameter.DISCRIMINATOR_KERNEL_SIZE])
-        print("Discriminator stride: ", config.HYPER_PARAMETERS[cst.LearningHyperParameter.DISCRIMINATOR_STRIDE])        
+        print("Discriminator stride: ", config.HYPER_PARAMETERS[cst.LearningHyperParameter.DISCRIMINATOR_STRIDE])

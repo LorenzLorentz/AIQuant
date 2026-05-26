@@ -66,6 +66,8 @@ class MultiAssetDiffusionEngine(LightningModule):
         self.optimizer = config.HYPER_PARAMETERS[LearningHyperParameter.OPTIMIZER]
         self.lr = config.HYPER_PARAMETERS[LearningHyperParameter.LEARNING_RATE]
         self.cond_size = config.COND_SIZE
+        self.train_with_spread_cond = bool(getattr(config, "TRAIN_WITH_SPREAD_COND", False))
+        self.spread_cond_dropout_prob = float(getattr(config, "SPREAD_COND_DROPOUT_PROB", 0.0))
 
         if self.IS_AUGMENTATION:
             self.feature_augmenter = pick_augmenter(
@@ -124,6 +126,7 @@ class MultiAssetDiffusionEngine(LightningModule):
                 batch_idx,
                 raw_cond_orders=raw_cond_orders,
                 raw_cond_lob=raw_cond_lob,
+                use_training_spread_cond=True,
             )
         else:
             self.t = torch.full(size=(x_0.shape[0],),
@@ -136,6 +139,7 @@ class MultiAssetDiffusionEngine(LightningModule):
                     cond_lob,
                     raw_cond_orders=raw_cond_orders,
                     raw_cond_lob=raw_cond_lob,
+                    use_training_spread_cond=False,
                 )
                 self.t = self.t - 1
         return recon
@@ -166,10 +170,18 @@ class MultiAssetDiffusionEngine(LightningModule):
         batch_idx=None,
         raw_cond_orders=None,
         raw_cond_lob=None,
+        use_training_spread_cond=False,
     ):
         x_t, noise = self.diffuser.forward_reparametrized(x_0, self.t)
         x_t_aug, cond_orders_aug, cond_lob_aug = self.diffuser.augment(x_t, cond_orders, cond_lob)
         weights = self.sampler.weights()
+        spread_cond = None
+        if use_training_spread_cond and self.train_with_spread_cond:
+            spread_cond = self.diffuser.training_spread_cond(
+                x_0,
+                raw_cond_lob,
+                dropout_prob=self.spread_cond_dropout_prob,
+            )
         return self.diffuser.ddpm_single_step(
             x_0,
             x_t_aug,
@@ -182,6 +194,7 @@ class MultiAssetDiffusionEngine(LightningModule):
             batch_idx,
             raw_cond_orders=raw_cond_orders,
             raw_cond_lob=raw_cond_lob,
+            spread_cond=spread_cond,
         )
 
     def type_embedding(self, x_0, cond):
