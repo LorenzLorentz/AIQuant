@@ -1,4 +1,5 @@
 from models.diffusers.multi_asset.graph.aggregator import AttentionAggregator
+from models.diffusers.multi_asset.graph.coupler import GraphCoupler
 from models.diffusers.multi_asset.graph.edge_weight_net import EdgeWeightNet
 from models.diffusers.multi_asset.graph.message_passing import MessageFunction
 from models.diffusers.multi_asset.graph.noise_fusion import NoiseFusion
@@ -8,6 +9,7 @@ from models.diffusers.multi_asset.graph.rolling_stats import compute_rolling_sta
 __all__ = [
     "AttentionAggregator",
     "EdgeWeightNet",
+    "GraphCoupler",
     "MessageFunction",
     "NoiseFusion",
     "RelationEmbedding",

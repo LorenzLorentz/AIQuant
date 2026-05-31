@@ -21,26 +21,12 @@ import constants as cst
 from constants import LearningHyperParameter
 from models.diffusers.multi_asset.ablation_flags import AblationFlags
 from models.diffusers.multi_asset.arbitrage import (
+    ArbitrageEnergyGuidance,
     ReverseLoopState,
     StressHead,
-    broadcast_spread_to_assets,
-    compute_spread,
-    decode_mid_price,
-    dynamic_delta,
-    energy,
-    group_rolling_stats,
-    guidance_lambda,
-    spread_inject_active,
-    update_tau,
 )
-from models.diffusers.multi_asset.graph import (
-    AttentionAggregator,
-    EdgeWeightNet,
-    MessageFunction,
-    NoiseFusion,
-    RelationEmbedding,
-    compute_rolling_stats,
-)
+from models.diffusers.multi_asset.graph import GraphCoupler
+from models.diffusers.multi_asset.spread import SpreadConditioner
 from models.diffusers.multi_asset.shared_score_net import SharedScoreNet
 
 
@@ -133,31 +119,12 @@ class MultiAssetGaussianDiffusion(nn.Module):
         self.ablation_flags = AblationFlags.from_config(config)
         relation_dim = getattr(config, "GRAPH_RELATION_DIM", 8)
         graph_hidden_dim = getattr(config, "GRAPH_HIDDEN_DIM", 32)
-        edge_src, edge_dst, edge_relation_ids = self._build_graph_edges()
-        self.register_buffer("edge_src", edge_src)
-        self.register_buffer("edge_dst", edge_dst)
-        self.register_buffer("edge_relation_ids", edge_relation_ids)
-        self.relation_embedding = RelationEmbedding(
-            num_relation_types=max(1, self.asset_universe.num_relation_types),
-            relation_dim=relation_dim,
-        )
-        self.edge_weight_net = EdgeWeightNet(
-            stats_dim=4,
+        self.graph_coupler = GraphCoupler(
+            asset_universe=self.asset_universe,
+            feature_dim=self.order_feature_dim,
             relation_dim=relation_dim,
             hidden_dim=graph_hidden_dim,
-        )
-        self.message_fn = MessageFunction(
-            feature_dim=self.order_feature_dim,
-            hidden_dim=graph_hidden_dim,
-        )
-        self.aggregator = AttentionAggregator(
-            feature_dim=self.order_feature_dim,
-            hidden_dim=graph_hidden_dim,
-        )
-        self.noise_fusion = NoiseFusion(
-            feature_dim=self.order_feature_dim,
-            hidden_dim=graph_hidden_dim,
-            init_gamma=0.0,
+            flags=self.ablation_flags,
         )
 
         # P2 spread-conditioning controls. ``K_SPREAD_STEPS=None`` maps to
@@ -165,6 +132,16 @@ class MultiAssetGaussianDiffusion(nn.Module):
         self.k_spread_steps = getattr(config, "K_SPREAD_STEPS", None)
         self.spread_price_feature_index = getattr(config, "SPREAD_PRICE_FEATURE_INDEX", None)
         self.spread_price_is_delta = bool(getattr(config, "SPREAD_PRICE_IS_DELTA", True))
+        self.spread_conditioner = SpreadConditioner(
+            asset_universe=self.asset_universe,
+            alphas_cumprod=self.alphas_cumprod,
+            num_diffusionsteps=self.num_diffusionsteps,
+            num_assets=self.num_assets,
+            k_spread_steps=self.k_spread_steps,
+            price_feature_index=self.spread_price_feature_index,
+            price_is_delta=self.spread_price_is_delta,
+            flags=self.ablation_flags,
+        )
 
         # P3 annealed energy-guidance controls. ``arb_delta_base`` is a
         # checkpointed non-trainable tolerance buffer; callers can overwrite it
@@ -175,6 +152,18 @@ class MultiAssetGaussianDiffusion(nn.Module):
         self.arb_lambda_max = float(getattr(config, "ARB_GUIDANCE_LAMBDA_MAX", 1.0))
         self.arb_lambda_power = float(getattr(config, "ARB_GUIDANCE_POWER", 2.0))
         self.arb_stress_head = StressHead(stats_dim=4)
+        self.arbitrage_guidance = ArbitrageEnergyGuidance(
+            asset_universe=self.asset_universe,
+            alphas_cumprod=self.alphas_cumprod,
+            num_diffusionsteps=self.num_diffusionsteps,
+            k_spread_steps=self.k_spread_steps,
+            price_feature_index=self.spread_price_feature_index,
+            price_is_delta=self.spread_price_is_delta,
+            kappa=self.arb_kappa,
+            lambda_max=self.arb_lambda_max,
+            lambda_power=self.arb_lambda_power,
+            flags=self.ablation_flags,
+        )
         self.register_load_state_dict_pre_hook(self._fill_missing_p3_state)
 
         # Extension points for P2 / P3. ``pre_fusion_hook`` computes the spread
@@ -193,52 +182,49 @@ class MultiAssetGaussianDiffusion(nn.Module):
         With ``disable_graph=True`` this returns ``eps_local`` directly,
         giving the P0 shared-backbone behavior bit-for-bit.
         """
-        if self.ablation_flags.disable_graph or self.edge_src.numel() == 0:
-            return eps_local
-
-        x_t = ctx["x_t"]
-        if x_t.shape[-1] != eps_local.shape[-1]:
-            raise ValueError(
-                "graph fusion expects x_t and eps_local to share the feature "
-                f"dimension, got {x_t.shape[-1]} and {eps_local.shape[-1]}"
-            )
-
         raw_cond_orders = ctx.get("raw_cond_orders", None)
         if raw_cond_orders is None:
             raw_cond_orders = ctx.get("cond_orders", None)
-        if raw_cond_orders is None:
-            return eps_local
         raw_cond_lob = ctx.get("raw_cond_lob", None)
         if raw_cond_lob is None:
             raw_cond_lob = ctx.get("cond_lob", None)
 
-        stats = compute_rolling_stats(raw_cond_orders, raw_cond_lob).to(
-            device=eps_local.device,
-            dtype=eps_local.dtype,
+        return self.graph_coupler(
+            eps_local,
+            x_t=ctx["x_t"],
+            cond_orders=raw_cond_orders,
+            cond_lob=raw_cond_lob,
         )
-        src = self.edge_src.to(eps_local.device)
-        dst = self.edge_dst.to(eps_local.device)
-        rel_ids = self.edge_relation_ids.to(eps_local.device)
-
-        stats_src = stats[:, src, :]
-        stats_dst = stats[:, dst, :]
-        relation_emb = self.relation_embedding(rel_ids).to(dtype=eps_local.dtype)
-        relation_emb = relation_emb.unsqueeze(0).expand(eps_local.shape[0], -1, -1)
-
-        edge_weights = self.edge_weight_net(stats_src, stats_dst, relation_emb)
-        if self.ablation_flags.freeze_edge_weights:
-            edge_weights = edge_weights.detach()
-
-        messages = self.message_fn(x_t[:, src, :, :], eps_local[:, src, :, :], edge_weights)
-        aggregated = self.aggregator(messages, x_t, src, dst, num_nodes=self.num_assets)
-        return self.noise_fusion(eps_local, aggregated)
 
     @property
     def graph_gamma(self):
-        return self.noise_fusion.gamma
+        return self.graph_coupler.gamma
+
+    @property
+    def noise_fusion(self):
+        """Backward-compatible access to the P1 residual fusion module."""
+        return self.graph_coupler.noise_fusion
 
     def _fill_missing_p3_state(self, _module, state_dict, prefix, *_args):
-        """Allow strict loading of P0/P1/P2 checkpoints that predate P3."""
+        """Allow strict loading of pre-refactor P0/P1/P2/P3 checkpoints."""
+        legacy_graph_prefixes = (
+            "edge_src",
+            "edge_dst",
+            "edge_relation_ids",
+            "relation_embedding.",
+            "edge_weight_net.",
+            "message_fn.",
+            "aggregator.",
+            "noise_fusion.",
+        )
+        for key in list(state_dict.keys()):
+            if not key.startswith(prefix):
+                continue
+            local_key = key[len(prefix):]
+            if any(local_key == item or local_key.startswith(item) for item in legacy_graph_prefixes):
+                state_dict.setdefault(prefix + "graph_coupler." + local_key, state_dict[key])
+                state_dict.pop(key)
+
         defaults = {
             "arb_delta_base": self.arb_delta_base,
             "arb_stress_head.linear.weight": self.arb_stress_head.linear.weight,
@@ -247,101 +233,18 @@ class MultiAssetGaussianDiffusion(nn.Module):
         for name, value in defaults.items():
             state_dict.setdefault(prefix + name, value.detach().clone())
 
-    def _build_graph_edges(self):
-        edges = list(self.asset_universe.directed_edges())
-        if not edges and self.num_assets > 1:
-            edges = [
-                (j, i)
-                for j in range(self.num_assets)
-                for i in range(self.num_assets)
-                if i != j
-            ]
-
-        src = []
-        dst = []
-        rel_ids = []
-        for j, i in edges:
-            src.append(j)
-            dst.append(i)
-            if (j, i) in self.asset_universe.relation_types:
-                rel_ids.append(self.asset_universe.relation_id(j, i))
-            else:
-                rel_ids.append(0)
-
-        return (
-            torch.tensor(src, dtype=torch.long),
-            torch.tensor(dst, dtype=torch.long),
-            torch.tensor(rel_ids, dtype=torch.long),
-        )
-
     # ---- P2 spread conditioning ----------------------------------------
 
     def _spread_pre_fusion_hook(self, x_t, state=None, t=None, cond_lob=None, **_ctx):
         """Compute the spread condition consumed by the next score-net call."""
-        if (
-            state is None
-            or self.ablation_flags.disable_spread_cond
-            or cond_lob is None
-            or not self.asset_universe.etf_basket_weights
-        ):
-            if state is not None:
-                state.update_spread(None)
-            return None
-
-        if t is None:
-            raise ValueError("t is required for spread conditioning")
-
-        active = spread_inject_active(
-            t,
-            num_diffusionsteps=self.num_diffusionsteps,
-            k_spread_steps=self.k_spread_steps,
-        )
-        if torch.is_tensor(active):
-            active = active.to(device=x_t.device)
-            if not bool(active.any().item()):
-                state.update_spread(None)
-                return None
-        elif not active:
-            state.update_spread(None)
-            return None
-
-        if state.last_eps_fused is None:
-            num_groups = len(self.asset_universe.etf_basket_weights)
-            spread = x_t.new_zeros(x_t.shape[0], num_groups)
-        else:
-            x0_hat = self._predict_x0_from_eps(x_t, state.last_eps_fused, t)
-            mid = decode_mid_price(
-                x0_hat,
-                cond_lob,
-                price_feature_index=self.spread_price_feature_index,
-                price_is_delta=self.spread_price_is_delta,
-            )
-            spread = compute_spread(mid, self.asset_universe)
-
-        if spread.shape[1] == 0:
-            state.update_spread(None)
-            return None
-        if torch.is_tensor(active):
-            spread = spread * active.to(dtype=spread.dtype).view(-1, 1)
-
-        state.update_spread(spread)
-        return broadcast_spread_to_assets(spread, self.asset_universe, self.num_assets)
+        self.spread_conditioner.k_spread_steps = self.k_spread_steps
+        self.spread_conditioner.price_feature_index = self.spread_price_feature_index
+        self.spread_conditioner.price_is_delta = self.spread_price_is_delta
+        return self.spread_conditioner(x_t=x_t, state=state, t=t, cond_lob=cond_lob)
 
     def _predict_x0_from_eps(self, x_t, eps_fused, t):
         """One-shot clean estimate used by the spread decoder."""
-        if eps_fused.shape != x_t.shape:
-            raise ValueError(
-                "eps_fused must have same shape as x_t for spread decoding: "
-                f"{tuple(eps_fused.shape)} vs {tuple(x_t.shape)}"
-            )
-        alpha_bar = self.alphas_cumprod[t].to(device=x_t.device, dtype=x_t.dtype)
-        if alpha_bar.dim() == 0:
-            alpha_bar = alpha_bar.expand(x_t.shape[0])
-        view_shape = (x_t.shape[0],) + (1,) * (x_t.dim() - 1)
-        alpha_bar = alpha_bar.view(view_shape)
-        sqrt_alpha_bar = torch.sqrt(alpha_bar).clamp_min(1e-12)
-        sqrt_one_minus = torch.sqrt((1.0 - alpha_bar).clamp_min(0.0))
-        return (x_t - sqrt_one_minus * eps_fused) / sqrt_alpha_bar
+        return self.spread_conditioner._predict_x0_from_eps(x_t, eps_fused, t)
 
     def set_arb_delta_base(self, delta_base) -> None:
         """Set the P3 base spread tolerance buffer.
@@ -365,125 +268,32 @@ class MultiAssetGaussianDiffusion(nn.Module):
                               cond_orders=None, cond_lob=None,
                               raw_cond_orders=None, raw_cond_lob=None, **_ctx):
         """Apply P3 energy-gradient guidance in eps space."""
-        if (
-            state is None
-            or self.ablation_flags.disable_arb_guidance
-            or t is None
-            or not self.asset_universe.etf_basket_weights
-        ):
-            return eps_fused
-
-        active = spread_inject_active(
-            t,
-            num_diffusionsteps=self.num_diffusionsteps,
-            k_spread_steps=self.k_spread_steps,
+        self.arbitrage_guidance.k_spread_steps = self.k_spread_steps
+        self.arbitrage_guidance.price_feature_index = self.spread_price_feature_index
+        self.arbitrage_guidance.price_is_delta = self.spread_price_is_delta
+        self.arbitrage_guidance.kappa = self.arb_kappa
+        self.arbitrage_guidance.lambda_max = self.arb_lambda_max
+        self.arbitrage_guidance.lambda_power = self.arb_lambda_power
+        return self.arbitrage_guidance(
+            eps_fused,
+            x_t=x_t,
+            t=t,
+            state=state,
+            cond_orders=cond_orders,
+            cond_lob=cond_lob,
+            raw_cond_orders=raw_cond_orders,
+            raw_cond_lob=raw_cond_lob,
+            delta_base=self.arb_delta_base,
+            stress_head=self.arb_stress_head,
         )
-        if torch.is_tensor(active):
-            active = active.to(device=x_t.device)
-            if not bool(active.any().item()):
-                state.update_spread(None)
-                state.reset_tau()
-                return eps_fused
-        elif not active:
-            state.update_spread(None)
-            state.reset_tau()
-            return eps_fused
-
-        spread_cond_lob = raw_cond_lob if raw_cond_lob is not None else cond_lob
-        if spread_cond_lob is None:
-            return eps_fused
-
-        # Recompute spread under a local grad context. eps is treated as a
-        # constant, so the gradient flows through only x_t -> x0_hat -> mid.
-        with torch.enable_grad():
-            x_for_grad = x_t.detach().requires_grad_(True)
-            eps_const = eps_fused.detach()
-            x0_hat = self._predict_x0_from_eps(x_for_grad, eps_const, t)
-            mid = decode_mid_price(
-                x0_hat,
-                spread_cond_lob.detach(),
-                price_feature_index=self.spread_price_feature_index,
-                price_is_delta=self.spread_price_is_delta,
-            )
-            spread = compute_spread(mid, self.asset_universe)
-            if spread.shape[1] == 0:
-                state.update_spread(None)
-                state.reset_tau()
-                return eps_fused
-
-            stats_orders = raw_cond_orders if raw_cond_orders is not None else cond_orders
-            if stats_orders is None:
-                stats_group = spread.new_zeros(spread.shape[0], spread.shape[1], 4)
-            else:
-                stats_lob = raw_cond_lob if raw_cond_lob is not None else cond_lob
-                rolling_stats = compute_rolling_stats(
-                    stats_orders.detach(),
-                    None if stats_lob is None else stats_lob.detach(),
-                ).to(device=spread.device, dtype=spread.dtype)
-                stats_group = group_rolling_stats(rolling_stats, self.asset_universe)
-
-            delta_dyn = dynamic_delta(
-                self.arb_delta_base,
-                stats_group,
-                stress_head=self.arb_stress_head,
-                kappa=self.arb_kappa,
-            ).to(device=spread.device, dtype=spread.dtype)
-            tau = update_tau(state.tau, spread.detach(), delta_dyn.detach(), active=active)
-            tau = tau.to(device=spread.device, dtype=spread.dtype)
-            arb_energy = energy(spread, delta_dyn, tau)
-            grad = torch.autograd.grad(
-                arb_energy,
-                x_for_grad,
-                retain_graph=False,
-                create_graph=False,
-                allow_unused=True,
-            )[0]
-
-        state.update_spread(spread.detach())
-        if grad is None:
-            return eps_fused
-        grad = torch.nan_to_num(grad.detach(), nan=0.0, posinf=0.0, neginf=0.0)
-        if not bool((grad != 0).any().item()):
-            return eps_fused
-
-        alpha_bar = self.alphas_cumprod.to(device=x_t.device, dtype=x_t.dtype)[t]
-        lambda_t = guidance_lambda(
-            t,
-            self.alphas_cumprod.to(device=x_t.device),
-            lambda_max=self.arb_lambda_max,
-            p=self.arb_lambda_power,
-        ).to(device=x_t.device, dtype=x_t.dtype)
-        if alpha_bar.dim() == 0:
-            alpha_bar = alpha_bar.expand(x_t.shape[0])
-        if lambda_t.dim() == 0:
-            lambda_t = lambda_t.expand(x_t.shape[0])
-        scale = lambda_t * torch.sqrt((1.0 - alpha_bar).clamp_min(0.0))
-        view_shape = (x_t.shape[0],) + (1,) * (x_t.dim() - 1)
-        guided = eps_fused + scale.view(view_shape) * grad.to(device=eps_fused.device, dtype=eps_fused.dtype)
-        return guided.detach()
 
     def training_spread_cond(self, x_0, cond_lob, dropout_prob: float = 0.0):
         """Optional P2.7 ground-truth spread condition for fresh P2 training."""
-        if (
-            self.ablation_flags.disable_spread_cond
-            or cond_lob is None
-            or not self.asset_universe.etf_basket_weights
-        ):
-            return None
-        mid = decode_mid_price(
+        return self.spread_conditioner.training_condition(
             x_0,
             cond_lob,
-            price_feature_index=self.spread_price_feature_index,
-            price_is_delta=self.spread_price_is_delta,
+            dropout_prob=dropout_prob,
         )
-        spread = compute_spread(mid, self.asset_universe)
-        if spread.shape[1] == 0:
-            return None
-        spread_cond = broadcast_spread_to_assets(spread, self.asset_universe, self.num_assets)
-        if dropout_prob > 0.0:
-            keep = torch.rand(spread_cond.shape[0], 1, device=spread_cond.device) >= dropout_prob
-            spread_cond = spread_cond * keep.to(dtype=spread_cond.dtype)
-        return spread_cond
 
     # ---- forward (noising) process --------------------------------------
 

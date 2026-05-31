@@ -43,6 +43,18 @@ class AblationFlags:
                 disable_arb_guidance=bool(structured.get("disable_arb_guidance", False)),
             )
 
+        remote_structured = getattr(config, "GRAPH_ABLATION_FLAGS", None)
+        if remote_structured is not None:
+            return cls(
+                disable_graph=bool(getattr(remote_structured, "disable_graph", False)),
+                freeze_edge_weights=bool(getattr(remote_structured, "freeze_edge_weights", False)),
+                disable_spread_cond=bool(
+                    getattr(remote_structured, "disable_spread_cond", False)
+                    or getattr(remote_structured, "disable_spread_conditioning", False)
+                ),
+                disable_arb_guidance=bool(getattr(remote_structured, "disable_arb_guidance", False)),
+            )
+
         legacy = getattr(config, "GRAPH_ABLATIONS", None)
         if isinstance(legacy, cls):
             return legacy

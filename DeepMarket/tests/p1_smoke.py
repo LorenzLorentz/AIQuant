@@ -23,12 +23,16 @@ if str(REPO_ROOT) not in sys.path:
 # does not use. Some lightweight local envs have torch but not torchvision.
 try:
     import torchvision  # noqa: F401
-except ModuleNotFoundError:
+    from torchvision import transforms  # noqa: F401
+except (ModuleNotFoundError, ImportError):
     torchvision_stub = types.ModuleType("torchvision")
     torchvision_models_stub = types.ModuleType("torchvision.models")
+    torchvision_transforms_stub = types.ModuleType("torchvision.transforms")
     torchvision_stub.models = torchvision_models_stub
+    torchvision_stub.transforms = torchvision_transforms_stub
     sys.modules["torchvision"] = torchvision_stub
     sys.modules["torchvision.models"] = torchvision_models_stub
+    sys.modules["torchvision.transforms"] = torchvision_transforms_stub
 
 import constants as cst
 from constants import LearningHyperParameter as LHP

@@ -40,6 +40,7 @@ if _torch is not None:
         spread_inject_active,
     )
     from models.diffusers.multi_asset.arbitrage.energy import (
+        ArbitrageEnergyGuidance,
         StressHead,
         calibrate_delta_base,
         dynamic_delta,
@@ -62,6 +63,7 @@ if _torch is not None:
     )
 
     __all__ += [
+        "ArbitrageEnergyGuidance",
         "ReverseLoopState",
         "StressHead",
         "broadcast_spread_to_assets",

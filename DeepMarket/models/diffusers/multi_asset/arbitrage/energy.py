@@ -5,7 +5,15 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from models.diffusers.multi_asset.arbitrage.spread_computer import spread_groups
+from models.diffusers.multi_asset.arbitrage.activation_schedule import spread_inject_active
+from models.diffusers.multi_asset.arbitrage.guidance_schedule import guidance_lambda
+from models.diffusers.multi_asset.arbitrage.persistence_tracker import update_tau
+from models.diffusers.multi_asset.arbitrage.spread_computer import (
+    compute_spread,
+    decode_mid_price,
+    spread_groups,
+)
+from models.diffusers.multi_asset.graph import compute_rolling_stats
 
 
 def rho(abs_spread: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
@@ -116,7 +124,175 @@ def calibrate_delta_base(spread: torch.Tensor) -> torch.Tensor:
     return spread.detach().abs().median(dim=0).values
 
 
+class ArbitrageEnergyGuidance(nn.Module):
+    """P3 annealed energy-gradient guidance hook.
+
+    The module keeps the local implementation's semantics. It computes the
+    ETF-basket spread from ``x_t -> x0_hat -> mid``, applies dynamic tolerance
+    and persistence counters, then returns the guided epsilon estimate.
+    """
+
+    def __init__(
+        self,
+        asset_universe,
+        alphas_cumprod: torch.Tensor,
+        num_diffusionsteps: int,
+        *,
+        k_spread_steps: int | None = None,
+        price_feature_index: int | None = None,
+        price_is_delta: bool = True,
+        kappa: float = 1.0,
+        lambda_max: float = 1.0,
+        lambda_power: float = 2.0,
+        flags=None,
+    ):
+        super().__init__()
+        self.asset_universe = asset_universe
+        self.alphas_cumprod = alphas_cumprod
+        self.num_diffusionsteps = int(num_diffusionsteps)
+        self.k_spread_steps = k_spread_steps
+        self.price_feature_index = price_feature_index
+        self.price_is_delta = bool(price_is_delta)
+        self.kappa = float(kappa)
+        self.lambda_max = float(lambda_max)
+        self.lambda_power = float(lambda_power)
+        self.flags = flags
+
+    def _disabled(self) -> bool:
+        return bool(getattr(self.flags, "disable_arb_guidance", False))
+
+    def _predict_x0_from_eps(self, x_t, eps_fused, t):
+        if eps_fused.shape != x_t.shape:
+            raise ValueError(
+                "eps_fused must have same shape as x_t for energy guidance: "
+                f"{tuple(eps_fused.shape)} vs {tuple(x_t.shape)}"
+            )
+        alpha_bar = self.alphas_cumprod.to(device=x_t.device, dtype=x_t.dtype)[t]
+        if alpha_bar.dim() == 0:
+            alpha_bar = alpha_bar.expand(x_t.shape[0])
+        view_shape = (x_t.shape[0],) + (1,) * (x_t.dim() - 1)
+        alpha_bar = alpha_bar.view(view_shape)
+        sqrt_alpha_bar = torch.sqrt(alpha_bar).clamp_min(1e-12)
+        sqrt_one_minus = torch.sqrt((1.0 - alpha_bar).clamp_min(0.0))
+        return (x_t - sqrt_one_minus * eps_fused) / sqrt_alpha_bar
+
+    def forward(
+        self,
+        eps_fused,
+        *,
+        x_t,
+        t=None,
+        state=None,
+        cond_orders=None,
+        cond_lob=None,
+        raw_cond_orders=None,
+        raw_cond_lob=None,
+        delta_base=None,
+        stress_head=None,
+    ):
+        if (
+            state is None
+            or self._disabled()
+            or t is None
+            or not self.asset_universe.etf_basket_weights
+        ):
+            return eps_fused
+
+        active = spread_inject_active(
+            t,
+            num_diffusionsteps=self.num_diffusionsteps,
+            k_spread_steps=self.k_spread_steps,
+        )
+        if torch.is_tensor(active):
+            active = active.to(device=x_t.device)
+            if not bool(active.any().item()):
+                state.update_spread(None)
+                state.reset_tau()
+                return eps_fused
+        elif not active:
+            state.update_spread(None)
+            state.reset_tau()
+            return eps_fused
+
+        spread_cond_lob = raw_cond_lob if raw_cond_lob is not None else cond_lob
+        if spread_cond_lob is None:
+            return eps_fused
+        if delta_base is None:
+            delta_base = eps_fused.new_tensor(1.0)
+
+        with torch.enable_grad():
+            x_for_grad = x_t.detach().requires_grad_(True)
+            eps_const = eps_fused.detach()
+            x0_hat = self._predict_x0_from_eps(x_for_grad, eps_const, t)
+            mid = decode_mid_price(
+                x0_hat,
+                spread_cond_lob.detach(),
+                price_feature_index=self.price_feature_index,
+                price_is_delta=self.price_is_delta,
+            )
+            spread = compute_spread(mid, self.asset_universe)
+            if spread.shape[1] == 0:
+                state.update_spread(None)
+                state.reset_tau()
+                return eps_fused
+
+            stats_orders = raw_cond_orders if raw_cond_orders is not None else cond_orders
+            if stats_orders is None:
+                stats_group = spread.new_zeros(spread.shape[0], spread.shape[1], 4)
+            else:
+                stats_lob = raw_cond_lob if raw_cond_lob is not None else cond_lob
+                rolling_stats = compute_rolling_stats(
+                    stats_orders.detach(),
+                    None if stats_lob is None else stats_lob.detach(),
+                ).to(device=spread.device, dtype=spread.dtype)
+                stats_group = group_rolling_stats(rolling_stats, self.asset_universe)
+
+            delta_dyn = dynamic_delta(
+                delta_base,
+                stats_group,
+                stress_head=stress_head,
+                kappa=self.kappa,
+            ).to(device=spread.device, dtype=spread.dtype)
+            tau = update_tau(state.tau, spread.detach(), delta_dyn.detach(), active=active)
+            tau = tau.to(device=spread.device, dtype=spread.dtype)
+            arb_energy = energy(spread, delta_dyn, tau)
+            grad = torch.autograd.grad(
+                arb_energy,
+                x_for_grad,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )[0]
+
+        state.update_spread(spread.detach())
+        if grad is None:
+            return eps_fused
+        grad = torch.nan_to_num(grad.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+        if not bool((grad != 0).any().item()):
+            return eps_fused
+
+        alpha_bar = self.alphas_cumprod.to(device=x_t.device, dtype=x_t.dtype)[t]
+        lambda_t = guidance_lambda(
+            t,
+            self.alphas_cumprod.to(device=x_t.device),
+            lambda_max=self.lambda_max,
+            p=self.lambda_power,
+        ).to(device=x_t.device, dtype=x_t.dtype)
+        if alpha_bar.dim() == 0:
+            alpha_bar = alpha_bar.expand(x_t.shape[0])
+        if lambda_t.dim() == 0:
+            lambda_t = lambda_t.expand(x_t.shape[0])
+        scale = lambda_t * torch.sqrt((1.0 - alpha_bar).clamp_min(0.0))
+        view_shape = (x_t.shape[0],) + (1,) * (x_t.dim() - 1)
+        guided = eps_fused + scale.view(view_shape) * grad.to(
+            device=eps_fused.device,
+            dtype=eps_fused.dtype,
+        )
+        return guided.detach()
+
+
 __all__ = [
+    "ArbitrageEnergyGuidance",
     "StressHead",
     "calibrate_delta_base",
     "dynamic_delta",
