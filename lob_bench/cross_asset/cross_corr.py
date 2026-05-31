@@ -86,10 +86,44 @@ def compare_realized_cross_corr(
     return results
 
 
+def nav_gap_series(
+    etf_book: pd.DataFrame | np.ndarray,
+    constituent_book: pd.DataFrame | np.ndarray,
+    weight: float = 1.0,
+) -> pd.Series:
+    """Return ETF mid minus weighted constituent mid."""
+    etf_mid = _mid_price(_as_frame(etf_book))
+    constituent_mid = _mid_price(_as_frame(constituent_book))
+    length = min(len(etf_mid), len(constituent_mid))
+    gap = etf_mid.iloc[:length].reset_index(drop=True) - float(weight) * constituent_mid.iloc[:length].reset_index(drop=True)
+    gap.name = "nav_gap"
+    return gap
+
+
+def nav_gap_error(
+    real_books: tuple[pd.DataFrame | np.ndarray, pd.DataFrame | np.ndarray],
+    gen_books: tuple[pd.DataFrame | np.ndarray, pd.DataFrame | np.ndarray],
+    weight: float = 1.0,
+) -> float:
+    """Mean absolute error between generated and real ETF-constituent gaps."""
+    real_gap = nav_gap_series(real_books[0], real_books[1], weight)
+    gen_gap = nav_gap_series(gen_books[0], gen_books[1], weight)
+    length = min(len(real_gap), len(gen_gap))
+    if length == 0:
+        return float("nan")
+    return float(np.mean(np.abs(gen_gap.iloc[:length].to_numpy() - real_gap.iloc[:length].to_numpy())))
+
+
 def _as_frame(data: pd.DataFrame | np.ndarray) -> pd.DataFrame:
     if isinstance(data, pd.DataFrame):
         return data
     return pd.DataFrame(data)
+
+
+def _mid_price(book_df: pd.DataFrame) -> pd.Series:
+    if book_df.shape[1] < 3:
+        raise ValueError("book must contain at least ask and bid price columns")
+    return (book_df.iloc[:, 0].astype(float) + book_df.iloc[:, 2].astype(float)) * 0.5
 
 
 def _align_returns(left: pd.Series, right: pd.Series) -> tuple[pd.Series, pd.Series]:

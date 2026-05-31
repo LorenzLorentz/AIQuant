@@ -49,6 +49,9 @@ class Configuration:
         self.GRAPH_RELATION_DIM = 8
         self.GRAPH_HIDDEN_DIM = None
         self.GRAPH_STATS_WINDOW = None
+        self.SPREAD_CONDITIONING_ENABLED = False
+        self.SPREAD_CONTEXT_DIM = 4
+        self.SPREAD_HIDDEN_DIM = None
 
         self.WANDB_INSTANCE = None
         self.WANDB_RUN_NAME = None

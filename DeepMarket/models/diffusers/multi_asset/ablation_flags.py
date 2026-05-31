@@ -1,6 +1,7 @@
 """Ablation switches for the multi-asset graph stack."""
 
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -13,4 +14,5 @@ class GraphAblationFlags:
 
     disable_graph: bool = False
     freeze_edge_weights: bool = False
+    disable_spread_conditioning: Optional[bool] = None
     disable_arb_guidance: bool = True

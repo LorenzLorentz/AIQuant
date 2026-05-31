@@ -21,6 +21,7 @@ import constants as cst
 from constants import LearningHyperParameter
 from models.diffusers.multi_asset.ablation_flags import GraphAblationFlags
 from models.diffusers.multi_asset.graph import GraphCoupler
+from models.diffusers.multi_asset.spread import SpreadConditioner
 from models.diffusers.multi_asset.shared_score_net import SharedScoreNet
 
 
@@ -111,10 +112,18 @@ class MultiAssetGaussianDiffusion(nn.Module):
         # Extension points for P2 / P3. Plain attributes (not nn.Module) so
         # that ablation toggles can swap them out without re-registering
         # parameters. Signature: hook(eps, x_t=..., t=..., **ctx) -> eps.
-        self.pre_fusion_hook = _identity_hook
         self.post_fusion_hook = _identity_hook
 
         self.graph_flags = getattr(config, "GRAPH_ABLATION_FLAGS", GraphAblationFlags())
+        self.spread_conditioner = SpreadConditioner(
+            asset_universe=asset_universe,
+            feature_dim=self.noise_size,
+            context_dim=getattr(config, "SPREAD_CONTEXT_DIM", 4),
+            hidden_dim=getattr(config, "SPREAD_HIDDEN_DIM", None),
+            enabled=getattr(config, "SPREAD_CONDITIONING_ENABLED", False),
+            flags=self.graph_flags,
+        )
+        self.pre_fusion_hook = self._spread_pre_fusion_hook
         self.graph_coupler = GraphCoupler(
             asset_universe=asset_universe,
             feature_dim=self.noise_size,
@@ -125,6 +134,14 @@ class MultiAssetGaussianDiffusion(nn.Module):
         )
 
         self.init_losses()
+
+    # ---- P2 hook ---------------------------------------------------------
+
+    def _spread_pre_fusion_hook(self, eps_local, **ctx):
+        return self.spread_conditioner(
+            eps_local,
+            cond_lob=ctx.get("cond_lob"),
+        )
 
     # ---- P1 hook ---------------------------------------------------------
 
