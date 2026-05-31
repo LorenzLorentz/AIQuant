@@ -52,6 +52,13 @@ class Configuration:
         self.SPREAD_CONDITIONING_ENABLED = False
         self.SPREAD_CONTEXT_DIM = 4
         self.SPREAD_HIDDEN_DIM = None
+        self.ENERGY_GUIDANCE_ENABLED = False
+        self.ENERGY_GUIDANCE_START_STEP = 10
+        self.ENERGY_GUIDANCE_MAX_SCALE = 0.01
+        self.ENERGY_GUIDANCE_DELTA = 1.0
+        self.ENERGY_GUIDANCE_MAX_GRAD_NORM = 1.0
+        self.ENERGY_PRICE_PROXY_INDEX = 5
+        self.ENERGY_PERSISTENCE_WEIGHT = 0.0
 
         self.WANDB_INSTANCE = None
         self.WANDB_RUN_NAME = None

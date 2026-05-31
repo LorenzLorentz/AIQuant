@@ -20,6 +20,7 @@ from torch import nn
 import constants as cst
 from constants import LearningHyperParameter
 from models.diffusers.multi_asset.ablation_flags import GraphAblationFlags
+from models.diffusers.multi_asset.arbitrage import ArbitrageEnergyGuidance
 from models.diffusers.multi_asset.graph import GraphCoupler
 from models.diffusers.multi_asset.spread import SpreadConditioner
 from models.diffusers.multi_asset.shared_score_net import SharedScoreNet
@@ -109,12 +110,22 @@ class MultiAssetGaussianDiffusion(nn.Module):
         # Fixed buffer of asset ids -- shape (N,), shared across batch.
         self.register_buffer("asset_ids", torch.arange(self.num_assets, dtype=torch.long))
 
-        # Extension points for P2 / P3. Plain attributes (not nn.Module) so
-        # that ablation toggles can swap them out without re-registering
-        # parameters. Signature: hook(eps, x_t=..., t=..., **ctx) -> eps.
-        self.post_fusion_hook = _identity_hook
-
         self.graph_flags = getattr(config, "GRAPH_ABLATION_FLAGS", GraphAblationFlags())
+        # Extension points for P2 / P3. Signature:
+        # hook(eps, x_t=..., t=..., **ctx) -> eps.
+        self.arbitrage_guidance = ArbitrageEnergyGuidance(
+            asset_universe=asset_universe,
+            alphas_cumprod=self.alphas_cumprod,
+            enabled=getattr(config, "ENERGY_GUIDANCE_ENABLED", False),
+            flags=self.graph_flags,
+            start_step=getattr(config, "ENERGY_GUIDANCE_START_STEP", 10),
+            max_scale=getattr(config, "ENERGY_GUIDANCE_MAX_SCALE", 0.01),
+            delta=getattr(config, "ENERGY_GUIDANCE_DELTA", 1.0),
+            max_grad_norm=getattr(config, "ENERGY_GUIDANCE_MAX_GRAD_NORM", 1.0),
+            price_proxy_index=getattr(config, "ENERGY_PRICE_PROXY_INDEX", 5),
+            persistence_weight=getattr(config, "ENERGY_PERSISTENCE_WEIGHT", 0.0),
+        )
+        self.post_fusion_hook = self._arbitrage_post_fusion_hook
         self.spread_conditioner = SpreadConditioner(
             asset_universe=asset_universe,
             feature_dim=self.noise_size,
@@ -140,6 +151,16 @@ class MultiAssetGaussianDiffusion(nn.Module):
     def _spread_pre_fusion_hook(self, eps_local, **ctx):
         return self.spread_conditioner(
             eps_local,
+            cond_lob=ctx.get("cond_lob"),
+        )
+
+    # ---- P3 hook ---------------------------------------------------------
+
+    def _arbitrage_post_fusion_hook(self, eps_fused, **ctx):
+        return self.arbitrage_guidance(
+            eps_fused,
+            x_t=ctx.get("x_t"),
+            t=ctx.get("t"),
             cond_lob=ctx.get("cond_lob"),
         )
 
@@ -237,6 +258,7 @@ class MultiAssetGaussianDiffusion(nn.Module):
         t = torch.full(size=(x_0.shape[0],), fill_value=self.num_diffusionsteps - 1,
                        device=cst.DEVICE, dtype=torch.int64)
         x_t, noise = self.forward_reparametrized(x_0, t)
+        self.arbitrage_guidance.reset_state()
         for _ in range(self.num_diffusionsteps - 1, -1, -1):
             x_t_aug, cond_orders, cond_lob = self.augment(x_t, orig_cond_orders, orig_cond_lob)
             x_t = self.ddpm_single_step(
@@ -259,6 +281,7 @@ class MultiAssetGaussianDiffusion(nn.Module):
         tmp = torch.full(size=(x_0.shape[0],), fill_value=self.num_diffusionsteps - 1,
                          device=cst.DEVICE, dtype=torch.int64)
         x_t, _ = self.forward_reparametrized(x_0, tmp)
+        self.arbitrage_guidance.reset_state()
         time_steps = torch.flip(self.t, dims=(0,))
         for i, step in enumerate(time_steps):
             x_t_aug, cond_orders, cond_lob = self.augment(x_t, orig_cond_orders, orig_cond_lob)

@@ -1,21 +1,21 @@
-# AIQuant Workflow — Multi-Asset Graph-Coupled Diffusion (P0 + P1 + P2)
+# AIQuant Workflow — Multi-Asset Graph-Coupled Diffusion (P0 + P1 + P2 + P3)
 
-This document covers the implementation scope **before** quasi-no-arbitrage is
-introduced. It describes:
+This document covers the implementation scope from the multi-asset baseline
+through quasi-no-arbitrage guidance. It describes:
 
 1. The problem we are solving in this scope.
 2. The model architecture and how it deviates from single-asset TRADES.
 3. The codebase layout — what is reused, what is added.
-4. A stepwise build plan: P0 (multi-asset shared backbone) → P1 (graph coupling) → P2 (spread-aware conditioning).
+4. A stepwise build plan: P0 (multi-asset shared backbone) → P1 (graph
+   coupling) → P2 (spread-aware conditioning) → P3 (annealed energy guidance).
 
-P3 (annealed energy guidance / quasi-no-arbitrage) is deferred and will be
-added to this document later. P2 only injects ETF-constituent price-relation
-context as a learnable conditioning residual; it does not impose hard
-constraints or modify the DDPM update.
+P3 adds optional soft guidance on ETF-basket price-relation energy. It does
+not impose hard constraints, replace P2 conditioning, or change the base
+DDPM/DDIM update equations.
 
 ---
 
-## 1. Problem Definition (scoped to P0 + P1 + P2)
+## 1. Problem Definition (scoped to P0 + P1 + P2 + P3)
 
 ### 1.1 Setting
 
@@ -54,9 +54,9 @@ Our model breaks this independence by making the per-step denoising of asset
 `i` depend on the current latent state and predicted noise of asset `j`,
 through a learned **state-dependent coupling**.
 
-### 1.3 What we are *not* doing in P0 + P1 + P2
+### 1.3 What we are *not* doing in P0 + P1 + P2 + P3
 
-- **No** explicit cross-asset constraints or arbitrage energy. Those are P3.
+- **No** hard cross-asset constraints. P3 is soft annealed guidance only.
 - **No** sparsification of the graph. With N = 2 the graph is fully connected
   (2 directed edges).
 - **No** multivariate-Hawkes / copula / ABIDES baselines yet. Those are P5.
@@ -68,6 +68,7 @@ through a learned **state-dependent coupling**.
 | P0    | Multi-asset shared-backbone diffusion trains end-to-end, per-asset loss curves look like TRADES. |
 | P1    | Adding graph coupling: (a) loss does not regress; (b) ablation flag `disable_graph=True` recovers P0 exactly; (c) generated trajectories show non-trivial cross-asset correlation that the P0 baseline lacks. |
 | P2    | Spread-aware hook defaults to P1 behavior; when enabled, it can learn from ETF-constituent spread / NAV-gap context without loss regression, and generated samples improve the cross-asset price-relation sanity metric over P1. |
+| P3    | Energy guidance defaults to P2 behavior; when enabled it only acts in late denoising, keeps guidance energy/loss finite, and generated samples improve the NAV-gap sanity metric over P2 baseline or at least do not regress. |
 
 Detailed metrics (lead–lag, cross-corr, etc.) live in P4 evaluation but we
 already need a coarse cross-correlation sanity check at the end of P1.
@@ -252,17 +253,76 @@ eps_spread[i] = eps_local[i]
 `γ_spread` is initialized to `0`, so enabling P2 starts exactly from P1
 behavior. P2 does not reconstruct future LOB state from generated orders.
 `x_hat_0`, annealed energy guidance, persistence tracking, and gradient
-correction are all deferred to P3.
+correction belong to P3.
 
-### 2.5 What is reused unchanged
+### 2.5 P3: Annealed Energy Guidance
+
+P3 adds an optional **post-fusion** quasi-no-arbitrage guidance hook. It uses
+ETF-basket metadata to reduce persistent generated NAV-gap dislocations during
+late denoising, without adding a training loss or hard projection.
+
+The post-fusion hook receives the fused noise estimate:
+
+```
+eps_guided = post_fusion_hook(eps_fused, x_t, t, cond_lob, ...)
+```
+
+When enabled, it reconstructs a clean-event proxy:
+
+```
+x_hat_0 = (x_t - sqrt(1 - alpha_bar_t) * eps_fused) / sqrt(alpha_bar_t)
+```
+
+P3 uses `x_hat_0[..., ENERGY_PRICE_PROXY_INDEX]` as a generated relative price
+proxy, averaged over the generation horizon and added to the latest
+conditioning mid price:
+
+```
+mid_hat_i = last_mid_i + mean_k(x_hat_0[i, k, price_proxy_index])
+gap_hat   = mid_hat_etf - Σ_j weight_j · mid_hat_constituent_j
+energy    = huber(gap_hat, delta=ENERGY_GUIDANCE_DELTA)
+```
+
+The guided noise is:
+
+```
+eps_guided = eps_fused - scale(t) · clipped_grad(energy, eps_fused)
+```
+
+where `scale(t)` is zero in high-noise timesteps and linearly ramps in the
+last `ENERGY_GUIDANCE_START_STEP` reverse steps up to
+`ENERGY_GUIDANCE_MAX_SCALE`. Defaults keep P3 off:
+
+```
+ENERGY_GUIDANCE_ENABLED       = False
+ENERGY_GUIDANCE_START_STEP    = 10
+ENERGY_GUIDANCE_MAX_SCALE     = 0.01
+ENERGY_GUIDANCE_DELTA         = 1.0
+ENERGY_GUIDANCE_MAX_GRAD_NORM = 1.0
+ENERGY_PRICE_PROXY_INDEX      = 5
+ENERGY_PERSISTENCE_WEIGHT     = 0.0
+```
+
+No-op rules:
+
+- no ETF basket metadata ⇒ no-op;
+- `GraphAblationFlags.disable_arb_guidance=True` ⇒ no-op;
+- disabled config or `scale(t)=0` ⇒ no-op;
+- invalid shapes, non-finite energy, or unavailable gradient ⇒ no-op.
+
+P3 v1 includes a persistence-tracker interface with zero default weight. This
+keeps the sampling-time state boundary explicit while avoiding extra behavior
+until persistence weighting is deliberately enabled.
+
+### 2.6 What is reused unchanged
 
 - `GaussianDiffusion.forward_reparametrized` — forward (noising) process.
 - The β schedule, `α_t`, `ᾱ_t`, posterior coefficients, EMA, type embedder.
 - The hybrid loss (`L_simple + λ·L_vlb`) — applied per asset and summed.
-- `DDPM` sampler (we stay with DDPM in P0/P1 for simplicity; DDIM can be
-  added later by porting the same fusion hook into `ddim_single_step`).
+- `DDPM` and `DDIM` update equations. P1/P2/P3 only change the noise estimate
+  before the existing reverse update is applied.
 
-### 2.6 Training objective
+### 2.7 Training objective
 
 Per-asset hybrid loss, summed:
 
@@ -271,10 +331,11 @@ L_total = Σ_{i=1}^{N}  L_hybrid^(i)
         = Σ_{i=1}^{N}  ( L_simple^(i) + λ · L_vlb^(i) )
 ```
 
-No auxiliary cross-asset loss in P0/P1/P2. The graph and spread-conditioning
-parameters are trained purely through the per-asset reconstruction gradient.
-If `γ` stays near zero through training, it is a signal that the graph is
-unhelpful and we should investigate before adding P3.
+No auxiliary cross-asset loss in P0/P1/P2/P3. The graph and
+spread-conditioning parameters are trained purely through the per-asset
+reconstruction gradient. P3 is inference/reverse-step guidance, not a training
+objective. If `γ` stays near zero through training, it is a signal that the
+graph is unhelpful and should be investigated before relying on guidance.
 
 ---
 
@@ -304,8 +365,8 @@ DeepMarket/
 │       ├── ma_diffusion_engine.py          [NEW] MultiAssetDiffusionEngine (Lightning)
 │       ├── ma_gaussian_diffusion.py        [NEW] reverse loop with graph hook
 │       ├── shared_score_net.py             [NEW] TRADES + asset embedding wrapper
-│       ├── ablation_flags.py               [NEW] disable_graph, freeze_edge_weights, disable_spread_conditioning
-│       └── graph/
+│       ├── ablation_flags.py               [NEW] disable_graph, freeze_edge_weights, disable_spread_conditioning, disable_arb_guidance
+│       ├── graph/
 │           ├── __init__.py
 │           ├── rolling_stats.py            [NEW] per-asset window statistics
 │           ├── relation_embedding.py       [NEW] r_{ji}
@@ -313,13 +374,19 @@ DeepMarket/
 │           ├── message_passing.py          [NEW] f_φ
 │           ├── aggregator.py               [NEW] attention aggregation
 │           └── noise_fusion.py             [NEW] g_ψ with learnable γ
-│       └── spread/
+│       ├── spread/
 │           ├── __init__.py
 │           ├── spread_context.py           [NEW] top-of-book mid/spread + NAV gap
 │           └── spread_conditioner.py       [NEW] pre-fusion residual conditioning
+│       └── arbitrage/
+│           ├── __init__.py
+│           ├── energy.py                   [NEW] x_hat_0 reconstruction + NAV-gap energy
+│           ├── guidance_schedule.py        [NEW] late-step annealed scale
+│           ├── persistence_tracker.py      [NEW] optional persistence multiplier
+│           └── consistency_check.py        [NEW] shape and basket metadata checks
 ```
 
-### 3.2 Files we deliberately do **not** touch in P0/P1/P2
+### 3.2 Files we deliberately do **not** touch in P0/P1/P2/P3
 
 - `models/diffusers/TRADES/TRADES.py` — the score net itself.
 - `models/diffusers/gaussian_diffusion.py` — the single-asset diffuser remains
@@ -330,22 +397,14 @@ DeepMarket/
 The multi-asset stack is parallel to the existing single-asset stack, not a
 modification of it.
 
-### 3.3 Where P3 will plug in later (placeholders, do not create yet)
+### 3.3 P3 hook boundary
 
-```
-models/diffusers/multi_asset/arbitrage/
-    energy.py
-    persistence_tracker.py
-    guidance_schedule.py
-    consistency_check.py
-```
-
-These will hook into `ma_gaussian_diffusion.py` at the post-fusion extension
-point:
+P3 hooks into `ma_gaussian_diffusion.py` at the post-fusion extension point:
 
 - `post_fusion_hook(eps_fused, x_t, ...)` — for energy guidance (P3).
 
-This hook is a no-op in P0/P1/P2.
+This hook is a no-op unless energy guidance is enabled, ETF basket metadata is
+present, and the current timestep is inside the late-denoising guidance window.
 
 ---
 
@@ -528,13 +587,72 @@ it before moving on. Steps are listed in execution order.
 > enabling P2 with ETF basket metadata is trainable, and no-basket configs
 > safely recover P1 behavior.
 
+### Phase P3 — Annealed Energy Guidance
+
+**Step P3.1 — Guidance schedule**
+- File: `models/diffusers/multi_asset/arbitrage/guidance_schedule.py`
+- Function: return zero guidance for high-noise steps and linearly ramp in
+  the last `ENERGY_GUIDANCE_START_STEP` reverse steps.
+- Verify: high `t` gives `0`, `t=0` gives `ENERGY_GUIDANCE_MAX_SCALE`.
+
+**Step P3.2 — NAV-gap energy**
+- File: `models/diffusers/multi_asset/arbitrage/energy.py`
+- Behavior:
+  - reconstruct `x_hat_0` from `(x_t, eps_fused, t)`;
+  - read generated price proxy from `ENERGY_PRICE_PROXY_INDEX`;
+  - combine with latest conditioning mid price;
+  - compute ETF-basket Huber NAV-gap energy.
+- Verify: reconstructed tensor shape matches `eps_fused`, energy/gaps are
+  finite, and gradients with respect to `eps_fused` are finite.
+
+**Step P3.3 — Guidance correction**
+- File: `models/diffusers/multi_asset/arbitrage/energy.py`
+- Behavior: compute a detached eps-space gradient correction and apply
+  `eps_fused - scale(t) * clipped_grad`. Clip per-batch gradient norm by
+  `ENERGY_GUIDANCE_MAX_GRAD_NORM`.
+- Verify: disabled/no-basket/high-`t` paths are exact no-ops; enabled late-`t`
+  path changes the noise estimate by a finite bounded amount.
+
+**Step P3.4 — Persistence and validation interfaces**
+- Files:
+  - `models/diffusers/multi_asset/arbitrage/persistence_tracker.py`
+  - `models/diffusers/multi_asset/arbitrage/consistency_check.py`
+- Behavior: provide default-zero persistence multiplier and centralized
+  basket/shape validation. Persistence state resets at the start of each
+  DDPM/DDIM sample loop.
+- Verify: default persistence weight leaves behavior unchanged.
+
+**Step P3.5 — Wire post-fusion hook**
+- Files: `configuration.py`, `ma_gaussian_diffusion.py`.
+- Add defaults:
+  - `ENERGY_GUIDANCE_ENABLED=False`
+  - `ENERGY_GUIDANCE_START_STEP=10`
+  - `ENERGY_GUIDANCE_MAX_SCALE=0.01`
+  - `ENERGY_GUIDANCE_DELTA=1.0`
+  - `ENERGY_GUIDANCE_MAX_GRAD_NORM=1.0`
+  - `ENERGY_PRICE_PROXY_INDEX=5`
+  - `ENERGY_PERSISTENCE_WEIGHT=0.0`
+- Wire `ArbitrageEnergyGuidance` into `post_fusion_hook`; default configs and
+  `disable_arb_guidance=True` recover P2.
+- Verify: P0/P1/P2 smoke tests continue to pass.
+
+**Step P3.6 — P3 smoke**
+- File: `DeepMarket/tests/p3_energy_smoke.py`
+- Checks:
+  - `x_hat_0` reconstruction shape and finite values;
+  - NAV-gap energy and gradient finite;
+  - no-basket, disabled, and high-`t` no-op paths;
+  - late-step guidance changes output and respects grad clipping;
+  - one `ddpm_single_step` has finite loss.
+
+> **P3 exit criterion**: P0/P1/P2/P3 smoke tests pass, P3 is off by default,
+> no-basket configs safely recover P2 behavior, and enabled late-step guidance
+> produces finite bounded corrections.
+
 ---
 
 ## 5. Open Items / Deferred
 
-- **Mid-price extraction from generated `x_t`** — needed by P3 energy
-  gradients. Agreed approach: use `x̂_0` reconstructed from the current noise
-  estimate; only activate energy in the last K reverse steps (small t).
 - **Score-net sharing strategy** — currently fully shared backbone +
   `asset_emb`. If marginal realism on the ETF vs. the constituent diverges
   noticeably in P0 evaluation, revisit by adding per-asset-class output
@@ -542,3 +660,5 @@ it before moving on. Steps are listed in execution order.
 - **N > 2 sparsification** — economic-prior + top-k. Not needed at N = 2.
 - **Baselines (B/C/D)** — copula post-hoc, Hawkes, ABIDES. Decide after P1
   results.
+- **P4 evaluation suite** — formalize cross-correlation, lead-lag, and NAV-gap
+  metrics on held-out windows after P3 smoke stability is locked.
