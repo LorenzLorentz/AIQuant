@@ -4,7 +4,7 @@
 All tensors carry a leading ``(B, N, ...)`` shape. P0 keeps the per-asset
 denoising fully independent: ``fuse`` is identity. P1 replaces ``fuse`` with
 a graph stack. P2 computes spread conditioning in ``pre_fusion_hook`` during
-sampling; P3 will add energy guidance in ``post_fusion_hook``.
+sampling; P3 applies energy guidance in ``post_fusion_hook``.
 
 Loss policy: each asset contributes a hybrid (L_simple + lambda * L_vlb)
 loss; the per-asset scalars are *summed* across assets so the batch-level
@@ -22,10 +22,16 @@ from constants import LearningHyperParameter
 from models.diffusers.multi_asset.ablation_flags import AblationFlags
 from models.diffusers.multi_asset.arbitrage import (
     ReverseLoopState,
+    StressHead,
     broadcast_spread_to_assets,
     compute_spread,
     decode_mid_price,
+    dynamic_delta,
+    energy,
+    group_rolling_stats,
+    guidance_lambda,
     spread_inject_active,
+    update_tau,
 )
 from models.diffusers.multi_asset.graph import (
     AttentionAggregator,
@@ -160,11 +166,22 @@ class MultiAssetGaussianDiffusion(nn.Module):
         self.spread_price_feature_index = getattr(config, "SPREAD_PRICE_FEATURE_INDEX", None)
         self.spread_price_is_delta = bool(getattr(config, "SPREAD_PRICE_IS_DELTA", True))
 
-        # Extension points for P2 / P3. ``pre_fusion_hook`` computes the
-        # spread condition before the score-net call; ``post_fusion_hook``
-        # remains the P3 no-op for now.
+        # P3 annealed energy-guidance controls. ``arb_delta_base`` is a
+        # checkpointed non-trainable tolerance buffer; callers can overwrite it
+        # with the training-set median |spread| via ``set_arb_delta_base``.
+        delta_base = getattr(config, "ARB_DELTA_BASE", 1.0)
+        self.register_buffer("arb_delta_base", torch.as_tensor(delta_base, dtype=torch.float32))
+        self.arb_kappa = float(getattr(config, "ARB_GUIDANCE_KAPPA", 1.0))
+        self.arb_lambda_max = float(getattr(config, "ARB_GUIDANCE_LAMBDA_MAX", 1.0))
+        self.arb_lambda_power = float(getattr(config, "ARB_GUIDANCE_POWER", 2.0))
+        self.arb_stress_head = StressHead(stats_dim=4)
+        self.register_load_state_dict_pre_hook(self._fill_missing_p3_state)
+
+        # Extension points for P2 / P3. ``pre_fusion_hook`` computes the spread
+        # condition before the score-net call; ``post_fusion_hook`` applies P3
+        # guidance unless the ablation flag makes it an exact no-op.
         self.pre_fusion_hook = self._spread_pre_fusion_hook
-        self.post_fusion_hook = _identity_hook
+        self.post_fusion_hook = self._arb_post_fusion_hook
 
         self.init_losses()
 
@@ -219,6 +236,16 @@ class MultiAssetGaussianDiffusion(nn.Module):
     @property
     def graph_gamma(self):
         return self.noise_fusion.gamma
+
+    def _fill_missing_p3_state(self, _module, state_dict, prefix, *_args):
+        """Allow strict loading of P0/P1/P2 checkpoints that predate P3."""
+        defaults = {
+            "arb_delta_base": self.arb_delta_base,
+            "arb_stress_head.linear.weight": self.arb_stress_head.linear.weight,
+            "arb_stress_head.linear.bias": self.arb_stress_head.linear.bias,
+        }
+        for name, value in defaults.items():
+            state_dict.setdefault(prefix + name, value.detach().clone())
 
     def _build_graph_edges(self):
         edges = list(self.asset_universe.directed_edges())
@@ -308,11 +335,132 @@ class MultiAssetGaussianDiffusion(nn.Module):
                 f"{tuple(eps_fused.shape)} vs {tuple(x_t.shape)}"
             )
         alpha_bar = self.alphas_cumprod[t].to(device=x_t.device, dtype=x_t.dtype)
+        if alpha_bar.dim() == 0:
+            alpha_bar = alpha_bar.expand(x_t.shape[0])
         view_shape = (x_t.shape[0],) + (1,) * (x_t.dim() - 1)
         alpha_bar = alpha_bar.view(view_shape)
         sqrt_alpha_bar = torch.sqrt(alpha_bar).clamp_min(1e-12)
         sqrt_one_minus = torch.sqrt((1.0 - alpha_bar).clamp_min(0.0))
         return (x_t - sqrt_one_minus * eps_fused) / sqrt_alpha_bar
+
+    def set_arb_delta_base(self, delta_base) -> None:
+        """Set the P3 base spread tolerance buffer.
+
+        Pass a scalar for one tolerance shared by all spread groups, or a
+        length-G tensor/list containing the training-set median ``|spread|`` per
+        group.
+        """
+        delta = torch.as_tensor(delta_base, device=self.arb_delta_base.device, dtype=self.arb_delta_base.dtype)
+        self.arb_delta_base = delta.detach().clone()
+
+    def calibrate_arb_delta_base(self, spread: torch.Tensor) -> torch.Tensor:
+        """Calibrate ``delta_base`` from a ``(B, G)`` historical spread tensor."""
+        if spread.dim() != 2:
+            raise ValueError(f"spread must be (B, G), got {tuple(spread.shape)}")
+        delta = spread.detach().abs().median(dim=0).values
+        self.set_arb_delta_base(delta)
+        return self.arb_delta_base
+
+    def _arb_post_fusion_hook(self, eps_fused, x_t, t=None, state=None,
+                              cond_orders=None, cond_lob=None,
+                              raw_cond_orders=None, raw_cond_lob=None, **_ctx):
+        """Apply P3 energy-gradient guidance in eps space."""
+        if (
+            state is None
+            or self.ablation_flags.disable_arb_guidance
+            or t is None
+            or not self.asset_universe.etf_basket_weights
+        ):
+            return eps_fused
+
+        active = spread_inject_active(
+            t,
+            num_diffusionsteps=self.num_diffusionsteps,
+            k_spread_steps=self.k_spread_steps,
+        )
+        if torch.is_tensor(active):
+            active = active.to(device=x_t.device)
+            if not bool(active.any().item()):
+                state.update_spread(None)
+                state.reset_tau()
+                return eps_fused
+        elif not active:
+            state.update_spread(None)
+            state.reset_tau()
+            return eps_fused
+
+        spread_cond_lob = raw_cond_lob if raw_cond_lob is not None else cond_lob
+        if spread_cond_lob is None:
+            return eps_fused
+
+        # Recompute spread under a local grad context. eps is treated as a
+        # constant, so the gradient flows through only x_t -> x0_hat -> mid.
+        with torch.enable_grad():
+            x_for_grad = x_t.detach().requires_grad_(True)
+            eps_const = eps_fused.detach()
+            x0_hat = self._predict_x0_from_eps(x_for_grad, eps_const, t)
+            mid = decode_mid_price(
+                x0_hat,
+                spread_cond_lob.detach(),
+                price_feature_index=self.spread_price_feature_index,
+                price_is_delta=self.spread_price_is_delta,
+            )
+            spread = compute_spread(mid, self.asset_universe)
+            if spread.shape[1] == 0:
+                state.update_spread(None)
+                state.reset_tau()
+                return eps_fused
+
+            stats_orders = raw_cond_orders if raw_cond_orders is not None else cond_orders
+            if stats_orders is None:
+                stats_group = spread.new_zeros(spread.shape[0], spread.shape[1], 4)
+            else:
+                stats_lob = raw_cond_lob if raw_cond_lob is not None else cond_lob
+                rolling_stats = compute_rolling_stats(
+                    stats_orders.detach(),
+                    None if stats_lob is None else stats_lob.detach(),
+                ).to(device=spread.device, dtype=spread.dtype)
+                stats_group = group_rolling_stats(rolling_stats, self.asset_universe)
+
+            delta_dyn = dynamic_delta(
+                self.arb_delta_base,
+                stats_group,
+                stress_head=self.arb_stress_head,
+                kappa=self.arb_kappa,
+            ).to(device=spread.device, dtype=spread.dtype)
+            tau = update_tau(state.tau, spread.detach(), delta_dyn.detach(), active=active)
+            tau = tau.to(device=spread.device, dtype=spread.dtype)
+            arb_energy = energy(spread, delta_dyn, tau)
+            grad = torch.autograd.grad(
+                arb_energy,
+                x_for_grad,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )[0]
+
+        state.update_spread(spread.detach())
+        if grad is None:
+            return eps_fused
+        grad = torch.nan_to_num(grad.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+        if not bool((grad != 0).any().item()):
+            return eps_fused
+
+        alpha_bar = self.alphas_cumprod.to(device=x_t.device, dtype=x_t.dtype)[t]
+        lambda_t = guidance_lambda(
+            t,
+            self.alphas_cumprod.to(device=x_t.device),
+            lambda_max=self.arb_lambda_max,
+            p=self.arb_lambda_power,
+        ).to(device=x_t.device, dtype=x_t.dtype)
+        if alpha_bar.dim() == 0:
+            alpha_bar = alpha_bar.expand(x_t.shape[0])
+        if lambda_t.dim() == 0:
+            lambda_t = lambda_t.expand(x_t.shape[0])
+        scale = lambda_t * torch.sqrt((1.0 - alpha_bar).clamp_min(0.0))
+        view_shape = (x_t.shape[0],) + (1,) * (x_t.dim() - 1)
+        guided = eps_fused + scale.view(view_shape) * grad.to(device=eps_fused.device, dtype=eps_fused.dtype)
+        return guided.detach()
 
     def training_spread_cond(self, x_0, cond_lob, dropout_prob: float = 0.0):
         """Optional P2.7 ground-truth spread condition for fresh P2 training."""

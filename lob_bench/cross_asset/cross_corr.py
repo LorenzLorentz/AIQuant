@@ -13,6 +13,18 @@ from pathlib import Path
 import numpy as np
 
 
+def aggregate_returns(returns, dt: int = 1):
+    """Aggregate log returns into fixed-size bars by summation."""
+    arr = np.asarray(returns, dtype=float).reshape(-1)
+    dt = max(1, int(dt))
+    if dt == 1:
+        return arr
+    usable = (arr.size // dt) * dt
+    if usable == 0:
+        return np.empty(0, dtype=float)
+    return arr[:usable].reshape(-1, dt).sum(axis=1)
+
+
 def mid_prices_from_lob(
     lob,
     bid_price_col: int = 0,
@@ -45,10 +57,10 @@ def log_returns_from_lob(lob, **mid_kwargs):
     return np.diff(np.log(mid), axis=-1)
 
 
-def realized_correlation(returns_a, returns_b, min_obs: int = 2):
+def realized_corr(returns_1, returns_2, dt: int = 1, min_obs: int = 2):
     """Pearson correlation between two return vectors, ignoring non-finites."""
-    a = np.asarray(returns_a, dtype=float).reshape(-1)
-    b = np.asarray(returns_b, dtype=float).reshape(-1)
+    a = aggregate_returns(returns_1, dt=dt)
+    b = aggregate_returns(returns_2, dt=dt)
     if a.shape != b.shape:
         raise ValueError(f"return vectors must share shape, got {a.shape} and {b.shape}")
     mask = np.isfinite(a) & np.isfinite(b)
@@ -59,6 +71,67 @@ def realized_correlation(returns_a, returns_b, min_obs: int = 2):
     if np.isclose(a.std(), 0.0) or np.isclose(b.std(), 0.0):
         return np.nan
     return float(np.corrcoef(a, b)[0, 1])
+
+
+def realized_correlation(returns_a, returns_b, min_obs: int = 2):
+    """Backward-compatible P1 alias for ``realized_corr(..., dt=1)``."""
+    return realized_corr(returns_a, returns_b, dt=1, min_obs=min_obs)
+
+
+def ccf(returns_1, returns_2, max_lag: int, dt: int = 1, min_obs: int = 2):
+    """Cross-correlation function ``corr(r1_t, r2_{t+lag})``.
+
+    Returns an array ordered by lags ``[-max_lag, ..., max_lag]``. Positive
+    lags mean asset 1 is compared with future asset-2 returns.
+    """
+
+    a = aggregate_returns(returns_1, dt=dt)
+    b = aggregate_returns(returns_2, dt=dt)
+    if a.shape != b.shape:
+        raise ValueError(f"return vectors must share shape, got {a.shape} and {b.shape}")
+    max_lag = int(max_lag)
+    if max_lag < 0:
+        raise ValueError("max_lag must be non-negative")
+
+    values = []
+    n = a.size
+    for lag in range(-max_lag, max_lag + 1):
+        if lag < 0:
+            x = a[-lag:]
+            y = b[: n + lag]
+        elif lag > 0:
+            x = a[: n - lag]
+            y = b[lag:]
+        else:
+            x = a
+            y = b
+        if x.size < min_obs:
+            values.append(np.nan)
+        else:
+            values.append(realized_corr(x, y, dt=1, min_obs=min_obs))
+    return np.asarray(values, dtype=float)
+
+
+def ccf_lags(max_lag: int):
+    """Return the lag vector matching ``ccf`` output."""
+    return np.arange(-int(max_lag), int(max_lag) + 1, dtype=int)
+
+
+def realized_corr_matrix(returns, dt: int = 1, min_obs: int = 2):
+    """Pearson correlation matrix for returns shaped ``(N,T)`` or ``(T,N)``."""
+    arr = np.asarray(returns, dtype=float)
+    if arr.ndim != 2:
+        raise ValueError(f"returns must be 2D, got {arr.shape}")
+    if arr.shape[0] > arr.shape[1]:
+        arr = arr.T
+    n_assets = arr.shape[0]
+    out = np.eye(n_assets, dtype=float)
+    for i in range(n_assets):
+        for j in range(i + 1, n_assets):
+            value = realized_corr(arr[i], arr[j], dt=dt, min_obs=min_obs)
+            out[i, j] = value
+            out[j, i] = value
+    return out
 
 
 def cross_corr_from_lob_pair(lob_pair, **mid_kwargs):

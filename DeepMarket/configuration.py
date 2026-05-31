@@ -55,6 +55,10 @@ class Configuration:
         self.SPREAD_PRICE_IS_DELTA = True
         self.TRAIN_WITH_SPREAD_COND = False
         self.SPREAD_COND_DROPOUT_PROB = 0.0
+        self.ARB_DELTA_BASE = 1.0
+        self.ARB_GUIDANCE_KAPPA = 1.0
+        self.ARB_GUIDANCE_LAMBDA_MAX = 1.0
+        self.ARB_GUIDANCE_POWER = 2.0
 
         self.WANDB_INSTANCE = None
         self.WANDB_RUN_NAME = None
