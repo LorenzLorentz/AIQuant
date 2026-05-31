@@ -2,6 +2,7 @@ from constants import LearningHyperParameter, LearningHyperParameter
 import constants as cst
 from utils.utils import noise_scheduler
 from preprocessing.AssetUniverse import AssetUniverse
+from models.diffusers.multi_asset.ablation_flags import GraphAblationFlags
 
 
 class Configuration:
@@ -44,6 +45,10 @@ class Configuration:
         # the user wired in. Default leaves it None so single-asset runs
         # never touch the multi-asset code path.
         self.ASSET_UNIVERSE: AssetUniverse | None = None
+        self.GRAPH_ABLATION_FLAGS = GraphAblationFlags()
+        self.GRAPH_RELATION_DIM = 8
+        self.GRAPH_HIDDEN_DIM = None
+        self.GRAPH_STATS_WINDOW = None
 
         self.WANDB_INSTANCE = None
         self.WANDB_RUN_NAME = None
