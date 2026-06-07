@@ -164,7 +164,7 @@ class MultiAssetGaussianDiffusion(nn.Module):
             lambda_power=self.arb_lambda_power,
             flags=self.ablation_flags,
         )
-        self.register_load_state_dict_pre_hook(self._fill_missing_p3_state)
+        self._register_p3_state_compat_hook()
 
         # Extension points for P2 / P3. ``pre_fusion_hook`` computes the spread
         # condition before the score-net call; ``post_fusion_hook`` applies P3
@@ -204,6 +204,13 @@ class MultiAssetGaussianDiffusion(nn.Module):
     def noise_fusion(self):
         """Backward-compatible access to the P1 residual fusion module."""
         return self.graph_coupler.noise_fusion
+
+    def _register_p3_state_compat_hook(self) -> None:
+        """Register checkpoint compatibility hook across PyTorch versions."""
+        if hasattr(self, "register_load_state_dict_pre_hook"):
+            self.register_load_state_dict_pre_hook(self._fill_missing_p3_state)
+        else:
+            self._register_load_state_dict_pre_hook(self._fill_missing_p3_state, with_module=True)
 
     def _fill_missing_p3_state(self, _module, state_dict, prefix, *_args):
         """Allow strict loading of pre-refactor P0/P1/P2/P3 checkpoints."""

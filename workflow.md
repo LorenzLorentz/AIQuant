@@ -7,6 +7,8 @@ phases:
 2. The model architecture and how it deviates from single-asset TRADES.
 3. The codebase layout — what is reused, what is added.
 4. A stepwise build plan across phases:
+   - **D0** — low-cost data adapters that keep the LOBSTER-style `.npy`
+     training contract without requiring paid multi-ticker LOBSTER access.
    - **P0** — multi-asset shared backbone (no cross-asset signal).
    - **P1** — graph coupling inside the reverse diffusion step.
    - **P2** — spread-aware conditioning (Layer 1 of quasi-no-arbitrage).
@@ -23,9 +25,12 @@ P0 and leave as no-ops until P2/P3.
 
 ### 1.1 Setting
 
-We have **N = 2** assets with a known economic relation (initial target:
-one ETF and one of its most heavily-weighted constituents from LOBSTER-style
-Level-3 data). Both assets are observed over a common time interval.
+We have **N = 2** assets with a known economic relation. The ideal target is
+one ETF and one heavily-weighted constituent from LOBSTER-style Level-3 data,
+but the project does **not** assume paid multi-ticker LOBSTER access. Low-cost
+adapters can instead convert IEX/Databento-style depth snapshots or FI-2010
+sanity data into the same DeepMarket `.npy` contract. Both assets are observed
+over a common time interval.
 
 For each asset `i ∈ {1, 2}` and each time step `t`:
 
@@ -77,6 +82,32 @@ through a learned **state-dependent coupling**.
 | P2    | Spread conditioning runs only in the last K reverse steps; (a) `disable_spread_cond=True` recovers P1; (b) the generated spread distribution is closer to the historical one than P1's. |
 | P3    | Energy guidance is applied via `post_fusion_hook`; (a) `disable_arb_guidance=True` recovers P2; (b) the four-corner ablation grid runs; (c) persistent (long-duration) spread excursions are reduced vs. P2 without flattening the spread distribution to zero. |
 | P4    | Cross-asset metrics (corr matrix, CCF, lead–lag error, spillover) and Layer 3 posterior consistency check produce a JSON report comparing P0/P1/P2/P3 on held-out data. |
+
+### 1.5 Data strategy if LOBSTER is unavailable
+
+The model-side code consumes a LOBSTER-like array, not LOBSTER licensing
+itself. Every data source must be adapted into one `.npy` per asset, where
+each row is:
+
+```
+[time, event_type, size, price, direction, depth,
+ ask_px_1, ask_sz_1, bid_px_1, bid_sz_1, ... ask_px_10, ask_sz_10, bid_px_10, bid_sz_10]
+```
+
+Fallback tiers:
+
+- **Databento small sample**: preferred low-cost equity route. Use
+  `QQQ + AAPL + MSFT + NVDA`, first with `MBP-10` for 1-3 trading days.
+- **IEX HIST**: free single-venue displayed-order-book route. Treat it as
+  IEX-specific LOB evidence, not consolidated Nasdaq/Lobster evidence.
+- **FI-2010**: public sanity check only. It verifies loaders, model wiring,
+  and metrics; it does not support ETF-NAV claims.
+- **Crypto spot/perp**: final fallback. If used, rewrite the paper claim from
+  ETF basket consistency to spot-perp basis consistency.
+
+Training cannot claim "multi-ticker LOBSTER Level-3 ETF basket" unless that
+data is actually obtained. The minimum defensible paper claim is a
+small multi-asset **LOB-style** generator with explicit data-source limits.
 
 ---
 
@@ -455,7 +486,12 @@ DeepMarket/
 │   ├── LOBSTERDataBuilder.py               [unchanged]
 │   ├── LOBDataset.py                       [unchanged]   ← used by baseline (A)
 │   ├── AssetUniverse.py                    [NEW] P0
-│   └── MultiAssetLOBDataset.py             [NEW] P0
+│   ├── MultiAssetLOBDataset.py             [NEW] P0
+│   └── adapters/                           [NEW] D0 low-cost source adapters
+│       ├── common.py                       [NEW] .npy contract + split/manifest helpers
+│       ├── lobster_adapter.py              [NEW] raw LOBSTER CSV → DeepMarket .npy
+│       ├── iex_or_databento_adapter.py     [NEW] equity MBP/snapshot → DeepMarket .npy
+│       └── fi2010_adapter.py               [NEW] FI-2010 feature sanity data → .npy
 │
 ├── models/diffusers/
 │   ├── TRADES/                             [unchanged]
@@ -532,6 +568,46 @@ nothing).
 
 Each step lists: the file(s) it touches, what it produces, and how we verify
 it before moving on. Steps are listed in execution order.
+
+### Phase D0 — Low-cost data adapters
+
+**Step D0.1 — Lock the training data contract**
+- File: `preprocessing/adapters/common.py`
+- Content: shared helpers for the DeepMarket-compatible row layout:
+  `[order(6) | lob(40)]`.
+- Behavior: validate shapes, synthesize proxy order tokens from L2 snapshots,
+  save single `.npy` files, save train/val/test splits, and write a sidecar
+  manifest that records source limitations.
+- Verify: saved arrays have exactly `46` columns and finite values.
+
+**Step D0.2 — Raw LOBSTER passthrough adapter**
+- File: `preprocessing/adapters/lobster_adapter.py`
+- Behavior: read raw LOBSTER message/orderbook CSVs, reuse DeepMarket's
+  preprocessing for inter-arrival/depth/event filtering, encode TRADES event
+  types to `{0,1,2}`, and emit the same `.npy` format as
+  `LOBSTERDataBuilder`.
+- Verify: synthetic message/orderbook frames convert to finite arrays and
+  preserve the top-10 LOB layout.
+
+**Step D0.3 — IEX/Databento equity snapshot adapter**
+- File: `preprocessing/adapters/iex_or_databento_adapter.py`
+- Behavior: infer common MBP/snapshot column names such as
+  `ask_px_00`, `ask_sz_00`, `bid_px_00`, `bid_sz_00` or
+  LOBSTER-style `sell1`, `vsell1`, `buy1`, `vbuy1`; produce a top-10 LOB and
+  synthetic proxy order tokens from consecutive snapshot changes.
+- Verify: synthetic Databento-style frames can be written and loaded by
+  `MultiAssetLOBDataset`.
+
+**Step D0.4 — FI-2010 sanity adapter**
+- File: `preprocessing/adapters/fi2010_adapter.py`
+- Behavior: map the first 40 FI-2010 features to the LOB layout and synthesize
+  proxy orders. Mark output manifests with the warning that FI-2010 is
+  feature-level sanity data only.
+- Verify: adapter smoke confirms it is usable for loader/model sanity checks.
+
+> **D0 exit criterion**: at least two generated `.npy` files from adapter
+> output can be loaded by `MultiAssetLOBDataset`, yielding `(N, K, F)` shapes,
+> before any paid data is required.
 
 ### Phase P0 — Multi-asset shared-backbone diffusion (no graph)
 
