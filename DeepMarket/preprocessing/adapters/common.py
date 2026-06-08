@@ -89,6 +89,10 @@ def save_lobster_like_npy(
         "columns": int(arr.shape[1]),
         "order_columns": ORDER_COLUMNS,
         "lob_layout": "ask_price,ask_size,bid_price,bid_size repeated for 10 levels",
+        # Adapters emit the LOBSTERDataBuilder *column layout* but do NOT z-score.
+        # Callers must z-score (matching LOBSTERDataBuilder) before training, or
+        # override this flag if they already did.
+        "normalized": False,
     }
     if manifest:
         meta.update(manifest)
@@ -134,6 +138,8 @@ def save_split_npys(
         "rows_total": int(n),
         "rows": {name: int(split.shape[0]) for name, split in splits.items()},
         "split_rates": list(split_rates),
+        # See note in save_lobster_like_npy: output is un-normalized by default.
+        "normalized": False,
     }
     if manifest:
         meta.update(manifest)
@@ -207,12 +213,16 @@ def timestamps_to_seconds(values: pd.Series) -> np.ndarray:
         raw = values.to_numpy(dtype=np.float64)
         span = np.nanmax(raw) - np.nanmin(raw) if len(raw) else 0.0
         magnitude = np.nanmedian(np.abs(raw)) if len(raw) else 0.0
-        if magnitude > 1e15 or span > 1e12:
-            raw = raw / 1e9
-        elif magnitude > 1e12 or span > 1e9:
-            raw = raw / 1e6
-        elif magnitude > 1e9 or span > 1e6:
-            raw = raw / 1e3
+        # Infer the epoch unit. 2020s epochs by magnitude: seconds ~1e9,
+        # milliseconds ~1e12, microseconds ~1e15, nanoseconds ~1e18. ``span``
+        # is the fallback for already-relative timestamps (small magnitude,
+        # large range over a trading day).
+        if magnitude > 1e17 or span > 1e13:
+            raw = raw / 1e9   # nanoseconds -> seconds
+        elif magnitude > 1e14 or span > 1e10:
+            raw = raw / 1e6   # microseconds -> seconds
+        elif magnitude > 1e11 or span > 1e7:
+            raw = raw / 1e3   # milliseconds -> seconds
         return raw - raw[0] if len(raw) else raw
 
     parsed = pd.to_datetime(values, utc=True)

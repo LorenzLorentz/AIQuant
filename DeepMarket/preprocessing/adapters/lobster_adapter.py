@@ -61,7 +61,9 @@ def lobster_frames_to_array(
     messages_proc["event_type"] = messages_proc["event_type"] - 1.0
     messages_proc["event_type"] = messages_proc["event_type"].replace({2.0: 1.0, 3.0: 2.0})
     messages_proc["price"] = messages_proc["price"] / price_divisor
-    orderbook_proc = orderbook_proc.iloc[:, :EXPECTED_LOB_COLS].copy()
+    # Cast to float before scaling: real LOBSTER orderbook CSVs load as int64,
+    # and an in-place ``iloc`` division would truncate (and warn) on int blocks.
+    orderbook_proc = orderbook_proc.iloc[:, :EXPECTED_LOB_COLS].astype(np.float64)
     orderbook_proc.iloc[:, ::2] = orderbook_proc.iloc[:, ::2] / price_divisor
 
     return lobster_like_array(

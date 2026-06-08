@@ -32,6 +32,8 @@
 - 拼接后单资产数组形状为 `(T, 46)`
 - 多资产训练时由 `MultiAssetLOBDataset` 读取多个资产 `.npy`，返回 `(B, N, K, F)` 风格的 batch
 
+> **归一化注意**：adapter 输出的是与 `LOBSTERDataBuilder` 相同的**列布局**，但**没有做 z-score 标准化**（只按 `price_divisor` 缩放价格）。`LOBSTERDataBuilder` 的正式产物是 z-score 之后的数组，模型也是在 z-score 数据上训练的。因此 adapter 产物在喂入训练前**必须**先做 z-score（用训练集统计量），否则尺度不匹配会让模型静默学坏。每个 `.npy` 旁的 manifest 里记录了 `"normalized": false` 作为提醒。
+
 已新增的 adapter 位于：
 
 ```text
@@ -196,7 +198,7 @@ raw data
 
 ```bash
 cd DeepMarket
-conda run -n mcts python -m tests.data_adapters_smoke
+conda run -n deep_market python -m tests.data_adapters_smoke
 ```
 
 该测试会验证：
@@ -210,11 +212,11 @@ conda run -n mcts python -m tests.data_adapters_smoke
 
 ```bash
 cd DeepMarket
-conda run -n mcts python -m tests.p0_smoke
-conda run -n mcts python -m tests.p1_smoke
-conda run -n mcts python -m tests.p2_smoke
-conda run -n mcts python -m tests.p3_smoke
-conda run -n mcts python -m tests.p4_smoke
+conda run -n deep_market python -m tests.p0_smoke
+conda run -n deep_market python -m tests.p1_smoke
+conda run -n deep_market python -m tests.p2_smoke
+conda run -n deep_market python -m tests.p3_smoke
+conda run -n deep_market python -m tests.p4_smoke
 ```
 
 通过这些测试后，说明新增数据层没有破坏：

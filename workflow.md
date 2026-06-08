@@ -584,8 +584,10 @@ it before moving on. Steps are listed in execution order.
 - File: `preprocessing/adapters/lobster_adapter.py`
 - Behavior: read raw LOBSTER message/orderbook CSVs, reuse DeepMarket's
   preprocessing for inter-arrival/depth/event filtering, encode TRADES event
-  types to `{0,1,2}`, and emit the same `.npy` format as
-  `LOBSTERDataBuilder`.
+  types to `{0,1,2}`, and emit the same `.npy` **column layout** as
+  `LOBSTERDataBuilder`. Note: output is **un-normalized** (z-scoring is left to
+  the experiment owner; the manifest records `normalized: false`), unlike
+  `LOBSTERDataBuilder`'s final z-scored arrays.
 - Verify: synthetic message/orderbook frames convert to finite arrays and
   preserve the top-10 LOB layout.
 
