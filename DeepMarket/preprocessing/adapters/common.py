@@ -209,7 +209,7 @@ def synthesize_orders_from_lob(
 
 def timestamps_to_seconds(values: pd.Series) -> np.ndarray:
     """Normalize common timestamp columns to seconds from the first row."""
-    if np.issubdtype(values.dtype, np.number):
+    if pd.api.types.is_numeric_dtype(values):
         raw = values.to_numpy(dtype=np.float64)
         span = np.nanmax(raw) - np.nanmin(raw) if len(raw) else 0.0
         magnitude = np.nanmedian(np.abs(raw)) if len(raw) else 0.0
@@ -226,5 +226,8 @@ def timestamps_to_seconds(values: pd.Series) -> np.ndarray:
         return raw - raw[0] if len(raw) else raw
 
     parsed = pd.to_datetime(values, utc=True)
-    seconds = parsed.astype("int64").to_numpy(dtype=np.float64) / 1e9
+    # tz-aware datetime64 -> UTC-naive ns -> seconds (robust across pandas versions;
+    # a direct astype("int64") on tz-aware dtypes raises in pandas 2.x).
+    ns = parsed.to_numpy("datetime64[ns]").astype("int64")
+    seconds = ns.astype(np.float64) / 1e9
     return seconds - seconds[0] if len(seconds) else seconds
