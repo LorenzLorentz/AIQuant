@@ -337,7 +337,9 @@ SMOKE=0 NDEV=1 EPOCHS=5 DISABLE_GRAPH=1 CUDA_VISIBLE_DEVICES=1 python run_ma_c38
 
 **评测 2(lob_bench AR,canonical,单 seed 1234)**:MEAN(all) A/B = full 0.433/0.466、p20 0.450/0.522、p10 0.477/0.474——**聚合 MEAN 看不出共享优势**(被 spread~0.9 / inter_arrival~0.9 / volume 等 rollout 动态项主导,price 占比小;且 B_p20 的 limit_ask_order_depth=0.82 是单 seed 离群把 B_p20 拉高)。但**订单放置的 bid 侧 depth 指标支持 rescue**:`limit_bid_order_depth` 独立 0.48→0.93→0.96(full→p20→p10)vs 共享 0.62→0.82→0.70(p10 共享 0.70 ≪ 独立 0.96);`bid_cancellation_depth` p10 共享 0.73 vs 独立 0.95。
 
-**结论(诚实)**:**共享主干对数据贫瘠资产的救援是真实的,在 teacher-forced 预测度量(尤其 price)上干净一致,在 lob_bench bid 侧放置指标上方向一致;但单 seed lob_bench 聚合 MEAN 被 spread/timing 噪声淹没,看不出。** 要在 lob_bench 聚合上确证需多 seed AR(单 seed AR 噪声大,见 B_p20 离群)。脚本:`eval_p0.py`、`build_lobbench_eval_ar_p0.py`(MODEL 切换,支持单资产 TRADES)、`_scripts/{p0_train,p0_eval,p0_lobbench}.sh`;launcher 加了 `VAL_CHECK_INTERVAL/LIMIT_VAL_BATCHES` 钮。
+**评测 2b(2 seed lob_bench,2026-06-11 补)**:加跑 seed42 后,**聚合 MEAN(all) 仍不分**(A/B:full 0.463/0.464、p20 0.472/0.499、p10 0.485/0.489——共享在 p20 反而略差,2 seed 仍是噪声);但**价格放置指标 `limit_bid_order_depth`(2 seed 均值)确证 rescue**:full A/B=0.638/0.697(满量独立更好,无干扰收益),p20=0.966/**0.826**、p10=0.966/**0.751**(数据贫瘠时共享显著更好)。即"共享救数据贫瘠资产"在**放置维度**上 2 seed 稳健,在 21 项聚合上被 spread/timing 噪声淹没。
+
+**结论(诚实,2 seed 定稿)**:**共享主干对数据贫瘠资产的救援是真实的,集中在"价格相对盘口的放置"维度** —— teacher-forced 预测度量(l1_price)干净一致 + lob_bench `limit_bid_order_depth` 2 seed 确证;但 **lob_bench 21 项聚合 MEAN 看不出**(price 占比太小、聚合被 spread/timing/volume 主导)。满量时共享几乎不损失甚至略让(无干扰)。脚本:`eval_p0.py`、`build_lobbench_eval_ar_p0.py`(MODEL 切换,支持单资产 TRADES)、`_scripts/{p0_train,p0_eval,p0_lobbench}.sh`(`p0_lobbench.sh` 带 `S` env 跑多 seed);launcher 加了 `VAL_CHECK_INTERVAL/LIMIT_VAL_BATCHES` 钮。
 
 ### 3.4l 攻时序 inter_arrival:时间通道加权(任务桶2 §2.2,2026-06-11)
 
@@ -365,7 +367,21 @@ SMOKE=0 NDEV=1 EPOCHS=5 DISABLE_GRAPH=1 CUDA_VISIBLE_DEVICES=1 python run_ma_c38
 **结论(诚实,两个 lever 都 negative)**:
 - option (a) MSE 时间加权:teacher-forced 点时间误差 ↓7%(2 seed、不伤其他字段),但 AR 分布 inter_arrival **更差**(0.886→0.939,CI 不重叠)——MSE 重加权治不了分布/重尾。
 - option (b) log-time 参数化:模型有效(MEAN 0.46–0.49 ≈ baseline),但 inter_arrival **0.93–0.94 ≈ baseline 0.886、并未改善**(略差)。
-- **inter_arrival(~0.9 L1)对"损失加权"和"边缘分布对数重参"都鲁棒不变**。注意:AR rollout inter_arrival 0.9 ≫ teacher-forced 0.66(§3.4e)≫ floor 0.064 —— 缺口主要在 **AR 序贯时间生成**(逐笔看着对、整段分布偏),不是边缘分布形状,所以 (a)/(b) 都治不了。**任务桶2 §2.2 目标(降 lob_bench inter_arrival)未达成;两条轻量路线已排除。** 剩下最有希望且未试 = option (c) **point-process / Hawkes 头**(显式把事件时间建成时序点过程,改的是生成机制而非损失/参数化),或重审 AR 时间反馈——属更大的架构改动,列为后续。补丁/数据均可逆(`TIME_LOSS_W` 默认 1.0;`*_lt` 为新增目录,不影响其他实验)。
+- **inter_arrival(~0.9 L1)对"损失加权"和"边缘分布对数重参"都鲁棒不变**。注意:AR rollout inter_arrival 0.9 ≫ teacher-forced 0.66(§3.4e)≫ floor 0.064 —— 缺口主要在 **AR 序贯时间生成**(逐笔看着对、整段分布偏),不是边缘分布形状,所以 (a)/(b) 都治不了。
+
+**做法(option c,2026-06-11 补,✅ 唯一奏效)**:**条件神经点过程时间头**(`pp_model.py`:GRU over 最近 K=32 笔 (log1p dt, etype) → log-normal 混合,NLL 训练;每资产一个)。AR 评测加 `PP_CKPT` env:**时间字段由点过程采样、其余字段(etype/size/price/dir)仍由扩散生成**,逐笔把生成的 (dt,etype) 喂回点过程历史。不动扩散模型(2.1/桶1 结果不受影响)。
+
+| inter_arrival(ETH,AR) | baseline | (a) TW=5 | (b) log-time | **(c) point-process** |
+|---|---|---|---|---|
+| **L1** | 0.886 | 0.939 | 0.93–0.94 | **0.840**(s1234 0.845 / s42 0.835) |
+| **Wasserstein** | 1.206 | — | — | **~0.50**(0.545 / 0.452) |
+
+→ **点过程头是唯一降 inter_arrival 的 lever,2 seed 一致**:L1 0.886→0.840(~5%),**Wasserstein 1.21→0.50(2.4×,分布距离大幅改善)**。代价:`vol_per_min`(时间耦合指标)变差(0.48→0.55),故 lob_bench MEAN ~持平(0.466→~0.477)。
+
+**结论(诚实,定稿)**:
+- option (a) MSE 时间加权:teacher-forced 点时间误差 ↓7% 但 AR 分布 inter_arrival **更差**(0.886→0.939)。
+- option (b) log-time 参数化:模型有效但 inter_arrival **不变**(~0.93)。
+- **option (c) 点过程头:✅ inter_arrival L1 0.886→0.840、Wasserstein 1.21→0.50(2 seed 稳)** —— 证实"问题在序贯时间生成机制,需用点过程而非损失/参数化去治"。代价是 vol_per_min 等时间耦合项,需联调(如点过程与扩散联合训练 / 共享上下文)。**任务桶2 §2.2 用 option (c) 取得正向进展(分布层面显著);后续可把点过程头并入主干联合训练以避免 vol_per_min 退化。** 全部补丁/数据可逆(`TIME_LOSS_W` 默认 1.0、`PP_CKPT` 不设即原行为、`*_lt` 与 `pp/` 为新增,不影响其他实验)。
 
 ### 3.5 当前状态
 

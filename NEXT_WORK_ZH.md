@@ -55,8 +55,8 @@
 
 ## 2. 短板改进 & 卖点强调
 
-> **✅ 完成(2026-06-11,见 EXPERIMENT_PLAN_ZH.md §3.4k)**:tiling 法做"ETH 数据贫瘠 / BTC 满量"的数据效率头对头(独立 TRADES vs 共享 MA no-graph,full/p20/p10×2seed)。**预测度量(eval_p0)上 P0 卖点成立**:独立随数据缩小退化 ~26%(几乎全在 price,l1_price 0.027→0.15),共享主干钉在满量水平(cont_l1~0.19,l1_price~0.03);lob_bench bid 侧 depth 指标方向一致,但单 seed lob_bench 聚合被 spread/timing 噪声淹没看不出(需多 seed AR 才能在聚合上确证)。
-> **✅ 完成(2026-06-11,§3.4l)**:试了 option (a) 时间通道 MSE 加权 + option (b) log-time 参数化,**两者都没降 lob_bench inter_arrival**(稳在 ~0.9);(a) 改善 teacher-forced 点时间误差但恶化 AR 分布,(b) 模型有效但 inter_arrival 不变。目标未达成,剩 option (c) point-process 头未试(列后续)。
+> **✅ 完成(2026-06-11,见 EXPERIMENT_PLAN_ZH.md §3.4k)**:tiling 法做"ETH 数据贫瘠 / BTC 满量"的数据效率头对头(独立 TRADES vs 共享 MA no-graph,full/p20/p10×2seed)。**P0 卖点成立,集中在"价格放置"维度**:独立随数据缩小退化 ~26%(几乎全在 price,l1_price 0.027→0.15),共享主干钉在满量水平(cont_l1~0.19,l1_price~0.03);**2 seed lob_bench `limit_bid_order_depth` 确证 rescue**(p20/p10 共享 0.826/0.751 vs 独立 0.966),但 lob_bench 21 项聚合 MEAN 仍被 spread/timing 噪声淹没看不出。
+> **✅ 完成(2026-06-11,§3.4l)**:option (a) 时间加权 + (b) log-time **都没降 inter_arrival**(~0.9);**option (c) 条件神经点过程时间头(`pp_model.py`)✅ 奏效**:时间字段由点过程采样、其余字段仍由扩散生成,**inter_arrival L1 0.886→0.840、Wasserstein 1.21→0.50(2 seed 稳)**;代价是 vol_per_min 等时间耦合项变差(MEAN ~持平),后续可把点过程头并入主干联合训练。
 > **✅ 完成(2026-06-11,§3.4j)**:TRADES 论文(arXiv 2502.07071)数字已抓取归档,并标注不可与我们的 crypto/AR lob_bench 直接对标。
 
 ### 2.1 【卖点】验证共享权重(P0)的价值 —— 最该先做

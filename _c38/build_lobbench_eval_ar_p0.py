@@ -173,6 +173,19 @@ def main():
     lob_buf = [z[ASSET][s - KCOND - 1:s, LO:].copy() for s in starts]
     gen_rows = [[] for _ in range(nW)]; gen_books = [[] for _ in range(nW)]
 
+    # option (c): point-process time head -- if PP_CKPT set, the time field is
+    # sampled from the conditional point-process model instead of the diffusion.
+    PP = None
+    if os.environ.get("PP_CKPT"):
+        from pp_model import PointProcess
+        PP = PointProcess.load(os.environ["PP_CKPT"], device=str(cst.DEVICE))
+        pp_ld = []; pp_et = []
+        for s in starts:
+            rdt = z[ASSET][s - 64:s, 0] * std[0] + mean[0]      # raw inter-arrival (LOGTIME=0 here)
+            pp_ld.append(list(np.log1p(np.clip(rdt, 1e-6, None))))
+            pp_et.append(list(np.clip(np.round(z[ASSET][s - 64:s, 1]), 0, 2).astype(int)))
+        print(f"[pp] point-process time head loaded: {os.environ['PP_CKPT']}")
+
     with torch.no_grad():
         for k in range(N_EVENTS):
             cond_o, cond_l, x0 = [], [], []
@@ -202,7 +215,13 @@ def main():
             for w in range(nW):
                 gv = g[w]
                 etype_class = int(np.argmin(np.sum(np.abs(temb - gv[1:1 + STE]), axis=1)))
-                zc = np.array([gv[0], etype_class, gv[STE + 1], gv[STE + 2],
+                if PP is not None:
+                    pp_dt = PP.sample(pp_ld[w], pp_et[w])
+                    zc0 = (pp_dt - mean[0]) / std[0]            # decodes back to pp_dt (LOGTIME=0)
+                    pp_ld[w].append(float(np.log1p(max(pp_dt, 1e-6)))); pp_et[w].append(etype_class)
+                else:
+                    zc0 = gv[0]
+                zc = np.array([zc0, etype_class, gv[STE + 1], gv[STE + 2],
                                1.0 if gv[STE + 3] >= 0 else -1.0, gv[-1]], np.float32)
                 t, et, size, price, d = denorm_order(zc)
                 oid, mprice = engines[w].step(et, price, size, d)
