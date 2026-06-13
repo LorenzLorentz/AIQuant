@@ -432,7 +432,24 @@ SMOKE=0 NDEV=1 EPOCHS=5 DISABLE_GRAPH=1 CUDA_VISIBLE_DEVICES=1 python run_ma_c38
 - ⚠️ **网格分辨率坑**:100ms 网格会把 perp/spot 误报成 `synchronous`(lead-lag 是 sub-100ms);故 build 默认在 **event-native tick + 10ms 网格**上测 lead-lag,**不**在对齐后的 100ms 数据上测。
 - **数据事实复核**:Tardis spot=`binance`、perp=`binance-futures`,同日同币;免费样本 = 每月 1 号全天(GET 可下,**HEAD 会误返 404**——之前误判"URL 失效"的坑)。
 
-**未做(属桶4.3,非数据部分)**:实际训练头对头、`run_ma_c38.py` 加 `UNIVERSE` 钮、跨资产一致性指标③、no-arb finite guard + 放开 gamma。方案 B(跨所)/C(QQQ)的 universe+spec 已配:B 可零成本拉(coinbase/okex venue 待首次拉时核对 symbol 与样本可用性),C 需 Databento 付费审批。
+**未做(属桶4.3,非数据部分)**:实际训练头对头、`run_ma_c38.py` 加 `UNIVERSE` 钮、跨资产一致性指标③、no-arb finite guard + 放开 gamma。
+
+### 3.4n-扩展 三方案数据全部落地(2026-06-13,扩量 + 付费 C)
+
+在 §3.4n 工具基础上,按"多抓几个月 / 干净 USDT 跨所 / 用 Databento 拉 C"扩展,**三方案训练就绪数据全部在 cluster38**(均 100ms 对齐 + z-score + split + 多日 lead-lag 验证):
+
+| 方案 | 资产 | train 行/资产 | 结构(lead-lag,多窗) |
+|---|---|---|---|
+| A | BTCUSDT perp/spot | **909k** | perp 领先 spot,HY 0.33–0.82(6 月全显著) |
+| A | ETHUSDT perp/spot | **890k** | perp 领先 spot,HY 0.29–0.86(6 月全显著) |
+| B | BTC binance/okex | **1.33M** | **okex 领先 binance**(负 lag 一致),HY 0.25–0.63(6 月全显著) |
+| C | QQQ+AAPL/MSFT/NVDA/AMZN | **1.44M** | QQQ↔成分同期 corr~1.0、HY~1.0(NAV 共动);index/成分无干净亚秒 lead-lag(正常) |
+
+- **工具新增**:`build_structured_pairs.py` 加 `--months YYYY-MM:YYYY-MM`(抓多个月 1 号免费样本 → 按资产拼接,逐日 lead-lag);`structured_universes` 加 `btc_cross_usdt`(binance+okex,**同 USDT 报价无污染**)、`btc_cross_usdt3`(+bybit,练 N>2 图);`preprocessing/fetch_databento.py`(方案 C:**先 get_cost 估价、仅 `--pull` 才下载**,LOCF 对齐篮子 + lead-lag)。
+- **A 多月**:2024-01~06 各月 1 号,perp 领先 spot 在 **6 个月全部显著**(HY 跨月 0.29–0.86)→ 结构稳健,非单日偶然。
+- **B coinbase 报价坑解法**:coinbase 是 BTC/USD,与 binance/okex(BTC/USDT)做 basis 会混入 USDT/USD 漂移。解法=**改用同 USDT 的 binance+okex(已采,干净)**;或拿 USDT/USD 参考序列把 coinbase 价换算后再差分;或注意 **lead-lag 用对数收益近似与报价无关**(污染只在价位 basis,不在收益)→ coinbase 仅 no-arb basis 项有问题,图的 lead-lag 信号不受影响。`btc_cross_exchange`(含 coinbase)保留但已标注。
+- **C Databento**:mbp-10、XNAS.ITCH、QQQ+4 成分;**实拉 3 个跨 regime 交易日(2024-03-01/06-03/09-03),实际花费 $5.50**(get_cost 估价一致;$1.5–2.5/日,$125 预算用 4%)。注意:① order 仍是 mbp-10 proxy(真逐笔需 mbo + 新 adapter);② 含盘前盘后(~15h/日),NAV 在 RTH 最干净,后续可裁到 RTH;③ **篮子权重 wᵢ 目前是近似值(0.09/0.08/0.08/0.05),正式 no-arb 实验前需换 QQQ 官方持仓权重**;④ databento 0.79 `to_df` API 是 `price_type=` 不是 `pretty_px=`(已修)。cluster `deep_market` env 已 `pip install databento`;key 放在 cluster `DeepMarket/.env`(chmod 600,gitignore)。
+- **GitHub 仍不通**(id_rsa 带密码、id_ed25519 未注册;直连 SSH 也拒)→ 代码改动靠 base64 经 `~/.aiquant_c38.sh` 传到 NAS;已 commit/push 到 GitHub(b4a1572)。
 
 ### 3.5 当前状态
 

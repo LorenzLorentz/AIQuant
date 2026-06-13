@@ -151,7 +151,8 @@
 - **方案 A/B 采集管线** = `preprocessing/build_structured_pairs.py`:下载 Tardis 日样本(GET;**注意 HEAD 会误报 404**)→ Tardis 原生列(adapter 已加 `asks[N].price/amount` 识别)→ top-10 → 可选**时间对齐**(LOCF 共享网格,补上 DATA_SOURCES §3.4 缺的对齐)→ 写 `_adapter_raw/<asset>.npy` + `.t.npy` 绝对秒 sidecar + lead-lag verdict。产物即 `build_real_datasets.py` 的输入(z-score+切分)。
 - **方案 C(ETF/成分)**:universe(`qqq_basket`)+ 数据源 spec 已配,但 `free=False` → 不自动拉,需 Databento key + `get_cost` 审批后单独拉,再指向 `build_real_datasets.py`。
 - 单测:`tests/structured_data_smoke.py`(无网络;adapter Tardis 列 / 三 universe 的 spread_groups / 已知 lag 的 lead-lag 复原)。
-- **下一步(桶4.3,非数据部分)**:在 cluster38 上对 A/B 真数据跑 §4.3 的 2×2×多 seed 头对头(coupled vs independent × no-arb ON/OFF),配方 `MSE_REDUCE=norm LR_SCHED=cosine LR=1e-3`;`run_ma_c38.py` 需加 `UNIVERSE` 钮从注册表选资产。
+- **扩量完成(2026-06-13)**:三方案训练就绪数据全部在 cluster38(见 EXPERIMENT_PLAN §3.4n-扩展):A=BTC/ETH perp/spot 各 ~90 万行(2024-01~06 六月,perp 领先 spot 6 月全显著);B=BTC binance/okex 1.33M(okex 领先,干净 USDT);C=QQQ+4 成分各 1.44M(Databento 实拉 3 日,**花 $5.50**,NAV 共动 corr~1.0)。
+- **下一步(桶4.3,非数据部分)**:在 cluster38 上跑 §4.3 的 2×2×多 seed 头对头(coupled vs independent × no-arb ON/OFF),配方 `MSE_REDUCE=norm LR_SCHED=cosine LR=1e-3`;`run_ma_c38.py` 需加 `UNIVERSE` 钮从 `structured_universes` 注册表选资产。注意:C 的篮子权重先换成 QQQ 官方持仓;C 数据含盘前盘后,no-arb 可先裁到 RTH。
 
 ### 4.3 跑图 + no-arb:期待收益、debug、找模型不足
 
