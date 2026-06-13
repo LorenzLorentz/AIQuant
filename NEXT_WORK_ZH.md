@@ -143,6 +143,16 @@
 - **lead-lag 量化脚本**(训练前验证,别假设):对两资产 mid-price 对数收益做**滞后互相关**和 **Hayashi-Yoshida**(异步成交友好)估计领先滞后符号与量级(如"perp 领先 spot ~X ms,峰值相关 ρ")。**只挑确有显著、可观 lead-lag 的对进训练**。挑剩的记录下来(负结果也有用)。
 - **填 `spread_groups`**:在 asset_universe 配置里声明 ETF↔篮子(或 perp↔spot)关系 + 权重,否则 P3 的 `group_rolling_stats` 返回空、energy=0。
 
+### 4.2-DONE 数据部分已完成(2026-06-13,见 `EXPERIMENT_PLAN_ZH.md` §3.4n)
+
+桶4 的**数据部分**(§4.2 全部:三方案管线 + 两个前置小工具)已落地为可复现工具,本地单测 + 真 Tardis 数据端到端验证通过:
+- **前置小工具 1(lead-lag 验证)** = `preprocessing/lead_lag.py`:滞后互相关(规则网格)+ Hayashi-Yoshida(异步原生,无重采样偏差)+ HRY 平移扫描;CLI 输出 verdict JSON(leader / peak_lag_ms / corr / hy_corr / significant)。**真数据结论:Binance BTCUSDT perp 领先 spot ~10ms,HY 相关 0.60(grid xcorr 仅 0.08——证明此场景必须用 HY)→ 方案 A 结构成立、可进训练。** 网格 100ms 太粗会显示"synchronous",lead-lag 须在 event-native tick 上以 ≤10ms 网格测(已设为 build 默认)。
+- **前置小工具 2(填 spread_groups)** = `AssetUniverse` 新增 `basis_pair`(A/B)、`cross_venue`(B,N>2,N−1 个 basis 组)、`etf_basket`(C,NAV 组);`preprocessing/structured_universes.py` = 三方案命名注册表(universe + 数据源 leg 单一真相源)。每个 universe 均产出非空 `spread_groups`(单测覆盖)。
+- **方案 A/B 采集管线** = `preprocessing/build_structured_pairs.py`:下载 Tardis 日样本(GET;**注意 HEAD 会误报 404**)→ Tardis 原生列(adapter 已加 `asks[N].price/amount` 识别)→ top-10 → 可选**时间对齐**(LOCF 共享网格,补上 DATA_SOURCES §3.4 缺的对齐)→ 写 `_adapter_raw/<asset>.npy` + `.t.npy` 绝对秒 sidecar + lead-lag verdict。产物即 `build_real_datasets.py` 的输入(z-score+切分)。
+- **方案 C(ETF/成分)**:universe(`qqq_basket`)+ 数据源 spec 已配,但 `free=False` → 不自动拉,需 Databento key + `get_cost` 审批后单独拉,再指向 `build_real_datasets.py`。
+- 单测:`tests/structured_data_smoke.py`(无网络;adapter Tardis 列 / 三 universe 的 spread_groups / 已知 lag 的 lead-lag 复原)。
+- **下一步(桶4.3,非数据部分)**:在 cluster38 上对 A/B 真数据跑 §4.3 的 2×2×多 seed 头对头(coupled vs independent × no-arb ON/OFF),配方 `MSE_REDUCE=norm LR_SCHED=cosine LR=1e-3`;`run_ma_c38.py` 需加 `UNIVERSE` 钮从注册表选资产。
+
 ### 4.3 跑图 + no-arb:期待收益、debug、找模型不足
 
 **前置修复(必做)**:

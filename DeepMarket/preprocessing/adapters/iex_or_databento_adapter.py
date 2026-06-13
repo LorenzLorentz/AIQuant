@@ -133,6 +133,7 @@ def _ask_price_candidates(level: int) -> tuple[str, ...]:
     return (
         f"ask_px_{two}", f"ask_price_{two}", f"ask_px_{one}", f"ask_price_{one}",
         f"ask{one}_price", f"ask{one}", f"sell{one}",
+        f"asks[{level}].price",  # Tardis book_snapshot (0-indexed, best = 0)
     )
 
 
@@ -143,6 +144,7 @@ def _ask_size_candidates(level: int) -> tuple[str, ...]:
         f"ask_sz_{two}", f"ask_size_{two}", f"ask_qty_{two}",
         f"ask_sz_{one}", f"ask_size_{one}", f"ask_qty_{one}",
         f"ask{one}_size", f"ask{one}_qty", f"vsell{one}",
+        f"asks[{level}].amount",  # Tardis book_snapshot
     )
 
 
@@ -152,6 +154,7 @@ def _bid_price_candidates(level: int) -> tuple[str, ...]:
     return (
         f"bid_px_{two}", f"bid_price_{two}", f"bid_px_{one}", f"bid_price_{one}",
         f"bid{one}_price", f"bid{one}", f"buy{one}",
+        f"bids[{level}].price",  # Tardis book_snapshot
     )
 
 
@@ -162,4 +165,5 @@ def _bid_size_candidates(level: int) -> tuple[str, ...]:
         f"bid_sz_{two}", f"bid_size_{two}", f"bid_qty_{two}",
         f"bid_sz_{one}", f"bid_size_{one}", f"bid_qty_{one}",
         f"bid{one}_size", f"bid{one}_qty", f"vbuy{one}",
+        f"bids[{level}].amount",  # Tardis book_snapshot
     )

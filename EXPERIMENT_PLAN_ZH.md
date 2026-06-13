@@ -410,6 +410,30 @@ SMOKE=0 NDEV=1 EPOCHS=5 DISABLE_GRAPH=1 CUDA_VISIBLE_DEVICES=1 python run_ma_c38
 - **推荐默认**(未改 launcher 默认值,保持可复现;新跑显式带):`MSE_REDUCE=norm LR_SCHED=cosine LR=1e-3`。ckpt:`*_c38_{nc,mc,base,mean}_lr1e3_s{1234,42}.ckpt`;eval `AIQuant_logs/stab_{eval,nceval}.log`。
 - **lob_bench AR 复核(nc s1234,8窗×500,DDIM-10,vs §3.4i 旧 baseline ng_s1234)**:**ETH MEAN(all) 0.482→0.444(真实改善 ~0.04)**,BTC 0.456→0.461(持平)。改善来自 spread(ETH 0.976→0.947)、imbalance(0.265→0.220)、**vol_per_min(BTC 0.341→0.243、ETH 0.390→0.238 两资产大降)**;**inter_arrival 略差**(BTC 0.80→0.90、ETH 0.90→0.92,此次未挂点过程头,时序仍短板)。即 **nc 配方在分布层面至少不亏、ETH 小赚**,稳定性增益渗到部分盘口动态;但单训练种子,ETH 的 0.04 建议多 seed 复核。输出 `data/lobbench/ar_nc/<asset>/`,驱动 `_c38/stab_lobbench_nc.sh`。
 
+### 3.4n 结构化多资产数据:管线 + lead-lag 验证(任务桶4 数据部分,2026-06-13)
+
+桶4 §4.2(三方案数据 + 两前置小工具)落地为可复现工具(本地单测 + 真 Tardis 端到端通过)。本地 Mac 写代码 commit/push,采集在 cluster38(经 `~/.aiquant_c38.sh` wrapper;直连 SSH 仍 publickey 拒)。
+
+**新增/改动(均已入 git):**
+- `preprocessing/lead_lag.py` — 滞后互相关(LOCF 规则网格 mid 对数收益)+ Hayashi-Yoshida(异步原生)+ HRY 平移 lead-lag 扫描。CLI:`python -m preprocessing.lead_lag A.npy B.npy --grid-ms 10 --max-lag-ms 500`,输出 verdict JSON。
+- `preprocessing/structured_universes.py` — 三方案命名注册表(`btc_spot_perp`/`eth_spot_perp`/`btc_cross_exchange`/`qqq_basket`),每条含 `AssetUniverse` + 数据源 `LegSpec`(单一真相源)。
+- `preprocessing/AssetUniverse.py` — 加 `basis_pair`(spot/perp、跨所)、`cross_venue`(N 资产、N−1 basis 组、全连接图)、`etf_basket`(NAV 组)三个构造器 → 填 `etf_basket_weights`(=`spread_groups`)+ `relation_types`。
+- `preprocessing/adapters/iex_or_databento_adapter.py` — 加 Tardis 原生列识别(`asks[N].price`/`asks[N].amount`/`bids[N].*`,0-indexed);`timestamp` µs 已由 `timestamps_to_seconds` 处理。
+- `preprocessing/build_structured_pairs.py` — 下载 Tardis 日样本 → adapter → 可选 LOCF 时间对齐(补 DATA_SOURCES §3.4 的对齐缺口)→ 写 `_adapter_raw/<asset>.npy` + `.t.npy` 绝对秒 sidecar + `<name>.leadlag.json`。产物即 `build_real_datasets.py` 输入。
+- `tests/structured_data_smoke.py` — 无网络单测(Tardis 列 / 三 universe spread_groups / 已知 lag 复原)。
+
+**真数据结论(Binance BTCUSDT,2024-01-01,20 万行)**:
+| 度量 | grid xcorr (10ms) | Hayashi-Yoshida |
+|---|---|---|
+| perp vs spot 相关 | 0.081 | **0.599** |
+| lead-lag | **perp 领先 10ms** | (HRY 扫描同向) |
+
+- ✅ **方案 A 结构成立**:perp 领先 spot ~10ms,符合"价格发现在衍生品端"。**HY(0.60)≫ grid xcorr(0.08)** —— 紧套利的同币种 spot/perp 在粗网格上被微结构噪声淹没,必须用异步原生的 HY 才看得清(本工具两个估计都给,正是为此)。
+- ⚠️ **网格分辨率坑**:100ms 网格会把 perp/spot 误报成 `synchronous`(lead-lag 是 sub-100ms);故 build 默认在 **event-native tick + 10ms 网格**上测 lead-lag,**不**在对齐后的 100ms 数据上测。
+- **数据事实复核**:Tardis spot=`binance`、perp=`binance-futures`,同日同币;免费样本 = 每月 1 号全天(GET 可下,**HEAD 会误返 404**——之前误判"URL 失效"的坑)。
+
+**未做(属桶4.3,非数据部分)**:实际训练头对头、`run_ma_c38.py` 加 `UNIVERSE` 钮、跨资产一致性指标③、no-arb finite guard + 放开 gamma。方案 B(跨所)/C(QQQ)的 universe+spec 已配:B 可零成本拉(coinbase/okex venue 待首次拉时核对 symbol 与样本可用性),C 需 Databento 付费审批。
+
 ### 3.5 当前状态
 
 - ✅ 环境打通；p0/p1 smoke + 单卡 MA_TRADES 训练在 GPU 上通过
