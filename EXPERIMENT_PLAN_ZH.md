@@ -453,6 +453,21 @@ SMOKE=0 NDEV=1 EPOCHS=5 DISABLE_GRAPH=1 CUDA_VISIBLE_DEVICES=1 python run_ma_c38
 
 - **C 收尾(2026-06-13)**:① 篮子权重换成官方 QQQ 持仓(mid-2024:AAPL .088/MSFT .082/NVDA .075/AMZN .050;并标注 4 只≈QQQ 30%→非完整 NAV 套利带,见下评估);② `preprocessing/clip_rth.py`(pandas tz、DST 正确)把 C 裁到 RTH 09:30–16:00 ET → `data/{QQQ,AAPL,MSFT,NVDA,AMZN}_rth/` 各 **597k train**(全日 41.5%)。
 
+### 3.4n-扩量定稿 三方案全部扩量(2026-06-13)
+
+应"扩时间段 + 给 C 补成分"要求,三方案数据扩量并 z-score 完成(全在 cluster38 `data/<asset>/`):
+
+| 方案 | 资产 | train 行/资产 | 覆盖 |
+|---|---|---|---|
+| A | BTCUSDT perp/spot | **1.81M** | 2024 全 12 月 |
+| A | ETHUSDT perp/spot | **1.75M** | 2024 全 12 月 |
+| B | BTC binance/okex/**bybit** | **2.53M** | 12 月,N=3 干净 USDT(练 N>2 图) |
+| C | QQQ + top-20 成分(21 资产) | **796k** | 4 个跨季 RTH 交易日(3/6/9/12 月) |
+
+- **A/B**:`--months 2024-01:2024-12`(免费样本每月 1 号),crypto 行数较 6 月版翻倍;B 升到 binance+okex+bybit 三所(N=3)。
+- **C**:`qqq_basket20` = QQQ + top-20 Nasdaq-100(AAPL…AMAT,**~65% 权重覆盖**,远好于之前 4 只的 30%);`fetch_databento --rth`(DST 正确,09:30–16:00 ET,免单独 clip);4 个 RTH session(2024-03-01/06-03/09-03/12-02)跨全年 regime。**实际再花 $13.05**(累计 Databento 花费 ≈ $19,$125 预算用 ~15%)。权重为近似官方值,正式 no-arb 前可换 per-date NPORT;65% 仍部分篮子 → delta_base 用实测基差校准,真·零基差带仍以 scheme A 为准。
+- 旧 `data/*_rth`(4 只版)与 6 月版已被覆盖/作废。
+
 ### 3.5 当前状态
 
 - ✅ 环境打通；p0/p1 smoke + 单卡 MA_TRADES 训练在 GPU 上通过
