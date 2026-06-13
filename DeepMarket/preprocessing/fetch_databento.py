@@ -58,7 +58,7 @@ def _symbol_t_lob(client, dataset, sym, schema, start, end) -> Tuple[np.ndarray,
     data = client.timeseries.get_range(
         dataset=dataset, symbols=[sym], schema=schema, start=start, end=end
     )
-    frame = data.to_df(pretty_px=True, pretty_ts=True).reset_index()
+    frame = data.to_df(price_type="float", pretty_ts=True).reset_index()
     return _abs_seconds(frame), equity_frame_to_lob(frame)
 
 
