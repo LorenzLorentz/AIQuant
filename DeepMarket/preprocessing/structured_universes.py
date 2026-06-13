@@ -134,11 +134,18 @@ REGISTRY: Dict[str, StructuredSpec] = {
             LegSpec("BTC_okex", "tardis", "okex", "BTC-USDT"),
         ],
     ),
-    # C  (QQQ top weights, approximate; refine with official holdings before use)
+    # C  Official Invesco QQQ holdings weights (~mid-2024: AAPL 8.8 / MSFT 8.2 /
+    # NVDA 7.5 / AMZN 5.0 %). QQQ weights drift daily with market cap; for an
+    # exact run use the per-date NPORT/Invesco holdings.
+    # CAVEAT: these 4 names are only ~30% of the Nasdaq-100, so QQQ - sum w*name
+    # is NOT a true zero NAV-arbitrage band (the missing ~70% dominates the
+    # residual). It is a co-movement consistency setup; for a real NAV no-arb
+    # band add ~all top constituents (cheap, +$/day) or use the spot/perp basis
+    # (scheme A), which IS a clean mean-reverting ~0 band.
     "qqq_basket": _etf_basket(
         "QQQ",
         ["AAPL", "MSFT", "NVDA", "AMZN"],
-        [0.09, 0.08, 0.08, 0.05],
+        [0.088, 0.082, 0.075, 0.050],
     ),
 }
 
