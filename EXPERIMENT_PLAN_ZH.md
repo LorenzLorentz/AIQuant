@@ -451,6 +451,8 @@ SMOKE=0 NDEV=1 EPOCHS=5 DISABLE_GRAPH=1 CUDA_VISIBLE_DEVICES=1 python run_ma_c38
 - **C Databento**:mbp-10、XNAS.ITCH、QQQ+4 成分;**实拉 3 个跨 regime 交易日(2024-03-01/06-03/09-03),实际花费 $5.50**(get_cost 估价一致;$1.5–2.5/日,$125 预算用 4%)。注意:① order 仍是 mbp-10 proxy(真逐笔需 mbo + 新 adapter);② 含盘前盘后(~15h/日),NAV 在 RTH 最干净,后续可裁到 RTH;③ **篮子权重 wᵢ 目前是近似值(0.09/0.08/0.08/0.05),正式 no-arb 实验前需换 QQQ 官方持仓权重**;④ databento 0.79 `to_df` API 是 `price_type=` 不是 `pretty_px=`(已修)。cluster `deep_market` env 已 `pip install databento`;key 放在 cluster `DeepMarket/.env`(chmod 600,gitignore)。
 - **GitHub 仍不通**(id_rsa 带密码、id_ed25519 未注册;直连 SSH 也拒)→ 代码改动靠 base64 经 `~/.aiquant_c38.sh` 传到 NAS;已 commit/push 到 GitHub(b4a1572)。
 
+- **C 收尾(2026-06-13)**:① 篮子权重换成官方 QQQ 持仓(mid-2024:AAPL .088/MSFT .082/NVDA .075/AMZN .050;并标注 4 只≈QQQ 30%→非完整 NAV 套利带,见下评估);② `preprocessing/clip_rth.py`(pandas tz、DST 正确)把 C 裁到 RTH 09:30–16:00 ET → `data/{QQQ,AAPL,MSFT,NVDA,AMZN}_rth/` 各 **597k train**(全日 41.5%)。
+
 ### 3.5 当前状态
 
 - ✅ 环境打通；p0/p1 smoke + 单卡 MA_TRADES 训练在 GPU 上通过
