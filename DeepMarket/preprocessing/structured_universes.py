@@ -134,18 +134,26 @@ REGISTRY: Dict[str, StructuredSpec] = {
             LegSpec("BTC_okex", "tardis", "okex", "BTC-USDT"),
         ],
     ),
-    # C  Official Invesco QQQ holdings weights (~mid-2024: AAPL 8.8 / MSFT 8.2 /
-    # NVDA 7.5 / AMZN 5.0 %). QQQ weights drift daily with market cap; for an
-    # exact run use the per-date NPORT/Invesco holdings.
-    # CAVEAT: these 4 names are only ~30% of the Nasdaq-100, so QQQ - sum w*name
-    # is NOT a true zero NAV-arbitrage band (the missing ~70% dominates the
-    # residual). It is a co-movement consistency setup; for a real NAV no-arb
-    # band add ~all top constituents (cheap, +$/day) or use the spot/perp basis
-    # (scheme A), which IS a clean mean-reverting ~0 band.
+    # C  4-name basket (~30% of QQQ) -- kept for the cheap/small validation.
     "qqq_basket": _etf_basket(
         "QQQ",
         ["AAPL", "MSFT", "NVDA", "AMZN"],
         [0.088, 0.082, 0.075, 0.050],
+    ),
+    # C-expanded  top-20 Nasdaq-100 names (~65% of QQQ by weight) -> a much more
+    # defensible NAV basket for the P3 no-arb energy. Weights are representative
+    # ~mid-2024 Invesco QQQ value-weights; refresh from the per-date NPORT/
+    # holdings for an exact run (they drift daily with market cap). Still partial
+    # (~35% missing), so calibrate delta_base on the realized basis; for a clean
+    # zero band the spot/perp basis (scheme A) remains the reference.
+    "qqq_basket20": _etf_basket(
+        "QQQ",
+        ["AAPL", "MSFT", "NVDA", "AMZN", "AVGO", "META", "GOOGL", "GOOG",
+         "TSLA", "COST", "NFLX", "AMD", "PEP", "ADBE", "CSCO", "TMUS",
+         "LIN", "QCOM", "INTU", "AMAT"],
+        [0.088, 0.082, 0.075, 0.050, 0.045, 0.045, 0.025, 0.024,
+         0.028, 0.025, 0.020, 0.018, 0.020, 0.018, 0.015, 0.015,
+         0.014, 0.013, 0.013, 0.012],
     ),
 }
 

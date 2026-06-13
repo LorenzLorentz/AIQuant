@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
+import pandas as pd
 
 import constants as cst
 from preprocessing import lead_lag, structured_universes
@@ -53,8 +54,17 @@ def estimate_cost(client, dataset, symbols, schema, start, end) -> float:
     return float(cost)
 
 
+def _session_window(day: str, rth: bool, tz: str = "America/New_York"):
+    """Return (start, end) for one session. RTH = 09:30-16:00 ET in UTC (DST-correct)."""
+    if not rth:
+        return day, (np.datetime64(day) + np.timedelta64(1, "D")).astype(str)
+    open_ = pd.Timestamp(f"{day} 09:30", tz=tz).tz_convert("UTC")
+    close = pd.Timestamp(f"{day} 16:00", tz=tz).tz_convert("UTC")
+    return open_.strftime("%Y-%m-%dT%H:%M:%S"), close.strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def _symbol_t_lob(client, dataset, sym, schema, start, end) -> Tuple[np.ndarray, np.ndarray]:
-    """Download one symbol/day and return (abs_seconds, lob[T,40])."""
+    """Download one symbol/window and return (abs_seconds, lob[T,40])."""
     data = client.timeseries.get_range(
         dataset=dataset, symbols=[sym], schema=schema, start=start, end=end
     )
@@ -62,13 +72,13 @@ def _symbol_t_lob(client, dataset, sym, schema, start, end) -> Tuple[np.ndarray,
     return _abs_seconds(frame), equity_frame_to_lob(frame)
 
 
-def pull(client, name, dataset, symbols, schema, dates, out_dir: Path,
+def pull(client, name, dataset, symbols, schema, windows, out_dir: Path,
          align_freq_ms: float | None) -> None:
-    """Pull each (symbol, day), LOCF-align the basket per day, concat days, save.
+    """Pull each (symbol, session), LOCF-align the basket per session, concat, save.
 
-    Alignment matters here: the ETF NAV basis ``QQQ - sum w_i constituent_i``
-    is only meaningful when the legs share a clock (P3 energy compares mids at
-    matched instants). Same machinery as the crypto driver.
+    ``windows`` = list of (label, start, end). Alignment matters: the ETF NAV
+    basis ``QQQ - sum w_i constituent_i`` is only meaningful when the legs share
+    a clock (P3 energy compares mids at matched instants).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     spec = structured_universes.get(name)
@@ -76,13 +86,12 @@ def pull(client, name, dataset, symbols, schema, dates, out_dir: Path,
     leg_times: dict = {s: [] for s in symbols}
     ref = symbols[0]
     verdicts = []
-    for day in dates:
-        nxt = (np.datetime64(day) + np.timedelta64(1, "D")).astype(str)
-        print(f"-- {day} --")
+    for day, start, end in windows:
+        print(f"-- {day} ({start}..{end}) --")
         raw = []
         for sym in symbols:
             print(f"  download {sym} {schema}")
-            raw.append(_symbol_t_lob(client, dataset, sym, schema, day, nxt))
+            raw.append(_symbol_t_lob(client, dataset, sym, schema, start, end))
         legs = align_legs(raw, align_freq_ms) if align_freq_ms else raw
         ev = {s: (t, 0.5 * (lob[:, 0] + lob[:, 2])) for s, (t, lob) in zip(symbols, raw)}
         for other in symbols[1:]:
@@ -103,14 +112,15 @@ def pull(client, name, dataset, symbols, schema, dates, out_dir: Path,
             arr[:, : cst.LEN_ORDER], arr[:, cst.LEN_ORDER :],
             out_dir / f"{sym}.npy",
             manifest={"adapter": "fetch_databento", "source": f"databento {dataset} {schema} {sym}",
-                      "dates": dates, "scheme": spec.scheme, "universe": name,
+                      "sessions": [w[0] for w in windows], "scheme": spec.scheme, "universe": name,
                       "aligned": bool(align_freq_ms), "align_freq_ms": align_freq_ms,
                       "warning": "mbp-10 order tokens are proxies, not Level-3 messages."},
         )
         np.save(out_dir / f"{sym}.t.npy", np.concatenate(leg_times[sym]))
-        print(f"    wrote {sym}.npy rows={arr.shape[0]} ({len(dates)} dates)")
+        print(f"    wrote {sym}.npy rows={arr.shape[0]} ({len(windows)} sessions)")
     (out_dir / f"{name}.leadlag.json").write_text(
-        json.dumps({"universe": name, "dates": dates, "lead_lag": verdicts}, indent=2), encoding="utf-8")
+        json.dumps({"universe": name, "sessions": [w[0] for w in windows], "lead_lag": verdicts},
+                   indent=2), encoding="utf-8")
 
 
 def main() -> None:
@@ -119,7 +129,9 @@ def main() -> None:
     ap.add_argument("--dataset", default="XNAS.ITCH")
     ap.add_argument("--schema", default="mbp-10")
     ap.add_argument("--dates", required=True,
-                    help="comma list of trading days YYYY-MM-DD (each = 1 RTH session)")
+                    help="comma list of trading days YYYY-MM-DD (each = 1 session)")
+    ap.add_argument("--rth", action="store_true",
+                    help="restrict each session to 09:30-16:00 ET (cheaper, cleaner NAV; no clip needed)")
     ap.add_argument("--align-freq-ms", type=float, default=100.0)
     ap.add_argument("--out-dir", default="data/_adapter_raw")
     ap.add_argument("--pull", action="store_true", help="actually download (spends credit)")
@@ -131,19 +143,19 @@ def main() -> None:
     symbols: List[str] = [l.symbol for l in spec.legs]
     client = db.Historical(_load_api_key())
     dates = [d.strip() for d in args.dates.split(",") if d.strip()]
+    windows = [(d, *_session_window(d, args.rth)) for d in dates]
 
-    print(f"[{args.name}] {args.dataset} {args.schema} {symbols}")
+    print(f"[{args.name}] {args.dataset} {args.schema} {len(symbols)} symbols, rth={args.rth}")
     total = 0.0
-    for day in dates:
-        nxt = (np.datetime64(day) + np.timedelta64(1, "D")).astype(str)
-        c = estimate_cost(client, args.dataset, symbols, args.schema, day, nxt)
+    for day, start, end in windows:
+        c = estimate_cost(client, args.dataset, symbols, args.schema, start, end)
         total += c
-        print(f"  {day}..{nxt}  ${c:.2f}")
-    print(f"  TOTAL ESTIMATED COST = ${total:.2f}  ({len(dates)} day(s))")
+        print(f"  {day} {start}..{end}  ${c:.2f}")
+    print(f"  TOTAL ESTIMATED COST = ${total:.2f}  ({len(windows)} session(s))")
     if not args.pull:
         print("  (estimate only; pass --pull to download)")
         return
-    pull(client, args.name, args.dataset, symbols, args.schema, dates,
+    pull(client, args.name, args.dataset, symbols, args.schema, windows,
          Path(args.out_dir), args.align_freq_ms)
     print("DATABENTO_PULL_DONE")
 
