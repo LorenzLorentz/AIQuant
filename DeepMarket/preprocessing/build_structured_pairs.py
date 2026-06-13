@@ -124,7 +124,7 @@ def leg_to_array(t: np.ndarray, lob: np.ndarray) -> np.ndarray:
 def build(
     name: str,
     *,
-    date: str,
+    dates: List[str],
     out_dir: Path,
     cache_dir: Path,
     max_rows: int | None,
@@ -133,76 +133,95 @@ def build(
     ll_max_lag_ms: float = 500.0,
 ) -> Dict[str, object]:
     spec = structured_universes.get(name)
-    print(f"[{name}] scheme {spec.scheme}: {[l.name for l in spec.legs]}")
+    print(f"[{name}] scheme {spec.scheme}: {[l.name for l in spec.legs]}  dates={dates}")
     if not spec.free:
         raise SystemExit(
             f"{name} is scheme {spec.scheme} ({spec.legs[0].source}); not auto-fetched. "
-            "Pull via the Databento path (API key + get_cost), then point "
-            "build_real_datasets.py at the resulting _adapter_raw npy."
+            "Pull via the Databento path (fetch_databento.py: get_cost + download), "
+            "then point build_real_datasets.py at the resulting _adapter_raw npy."
         )
 
-    raw_legs: List[Tuple[np.ndarray, np.ndarray]] = []
-    for leg in spec.legs:
-        gz = download_tardis(leg.venue, leg.symbol, date, cache_dir)
-        raw_legs.append(load_leg(gz, max_rows))
-
-    if align_freq_ms:
-        legs = align_legs(raw_legs, align_freq_ms)
-    else:
-        legs = raw_legs
-
     out_dir.mkdir(parents=True, exist_ok=True)
-    times: Dict[str, np.ndarray] = {}
-    mids: Dict[str, np.ndarray] = {}
-    for leg, (t, lob) in zip(spec.legs, legs):
-        arr = leg_to_array(t, lob)
+    # Per leg, accumulate (T,46) arrays + abs-time across all dates, and collect
+    # one lead-lag verdict per date (measured on that day's event-native ticks).
+    leg_arrays: Dict[str, List[np.ndarray]] = {l.name: [] for l in spec.legs}
+    leg_times: Dict[str, List[np.ndarray]] = {l.name: [] for l in spec.legs}
+    ref = spec.legs[0].name
+    verdicts: List[Dict[str, object]] = []
+
+    for date in dates:
+        print(f"-- {date} --")
+        raw_legs: List[Tuple[np.ndarray, np.ndarray]] = []
+        for leg in spec.legs:
+            gz = download_tardis(leg.venue, leg.symbol, date, cache_dir)
+            raw_legs.append(load_leg(gz, max_rows))
+        legs = align_legs(raw_legs, align_freq_ms) if align_freq_ms else raw_legs
+
+        # Per-day, full-resolution lead-lag (don't span days at 10ms -> blowup).
+        ev = {l.name: (t, 0.5 * (lob[:, 0] + lob[:, 2])) for l, (t, lob) in zip(spec.legs, raw_legs)}
+        for other in spec.legs[1:]:
+            v = lead_lag.analyze(*ev[ref], *ev[other.name], name_a=ref, name_b=other.name,
+                                 grid_ms=ll_grid_ms, max_lag_ms=ll_max_lag_ms)
+            v["date"] = date
+            verdicts.append(v)
+            print(f"  lead-lag {ref} vs {other.name}: leader={v['leader']} "
+                  f"peak_lag={v['xcorr_peak_lag_ms']}ms corr={v['xcorr_peak_corr']:.3f} "
+                  f"hy_corr={v.get('hy_corr', float('nan')):.3f} significant={v['significant']}")
+
+        for leg, (t, lob) in zip(spec.legs, legs):
+            leg_arrays[leg.name].append(leg_to_array(t, lob))
+            leg_times[leg.name].append(t.astype(np.float64))
+
+    # Concatenate dates per leg and save (z-score/split is build_real_datasets.py).
+    for leg in spec.legs:
+        arr = np.concatenate(leg_arrays[leg.name], axis=0)
         save_lobster_like_npy(
             arr[:, : cst.LEN_ORDER], arr[:, cst.LEN_ORDER :],
             out_dir / f"{leg.name}.npy",
             manifest={
                 "adapter": "build_structured_pairs",
-                "source": f"tardis {leg.venue} book_snapshot_25 {leg.symbol} {date}",
-                "scheme": spec.scheme,
-                "universe": name,
-                "aligned": bool(align_freq_ms),
-                "align_freq_ms": align_freq_ms,
+                "source": f"tardis {leg.venue} book_snapshot_25 {leg.symbol}",
+                "dates": dates, "scheme": spec.scheme, "universe": name,
+                "aligned": bool(align_freq_ms), "align_freq_ms": align_freq_ms,
                 "warning": "Snapshot-derived order tokens are proxies, not Level-3 messages.",
             },
         )
-        np.save(out_dir / f"{leg.name}.t.npy", t.astype(np.float64))
-        print(f"  wrote {leg.name}.npy  rows={arr.shape[0]}")
+        np.save(out_dir / f"{leg.name}.t.npy", np.concatenate(leg_times[leg.name]))
+        print(f"  wrote {leg.name}.npy  rows={arr.shape[0]} ({len(dates)} dates)")
 
-    # Lead-lag is measured on the *event-native* ticks (raw_legs), not the
-    # LOCF-aligned grid, so sub-grid lead-lag (perp leads spot by ~10-50ms) is
-    # not washed out by the alignment step.
-    for leg, (t, lob) in zip(spec.legs, raw_legs):
-        times[leg.name] = t
-        mids[leg.name] = 0.5 * (lob[:, 0] + lob[:, 2])
-
-    # Lead-lag: reference leg (index 0) vs every other leg.
-    ref = spec.legs[0].name
-    verdicts = []
-    for other in spec.legs[1:]:
-        v = lead_lag.analyze(
-            times[ref], mids[ref], times[other.name], mids[other.name],
-            name_a=ref, name_b=other.name,
-            grid_ms=ll_grid_ms, max_lag_ms=ll_max_lag_ms,
-        )
-        verdicts.append(v)
-        print(f"  lead-lag {ref} vs {other.name}: "
-              f"leader={v['leader']} peak_lag={v['xcorr_peak_lag_ms']}ms "
-              f"corr={v['xcorr_peak_corr']:.3f} hy_corr={v.get('hy_corr', float('nan')):.3f} "
-              f"significant={v['significant']}")
-    report = {"universe": name, "scheme": spec.scheme, "date": date,
+    report = {"universe": name, "scheme": spec.scheme, "dates": dates,
               "notes": spec.notes, "lead_lag": verdicts}
     (out_dir / f"{name}.leadlag.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
 
 
+def _resolve_dates(args) -> List[str]:
+    """Build the date list from --months (range) | --dates (list) | --date."""
+    if args.months:
+        lo, hi = args.months.split(":")
+        y0, m0 = (int(x) for x in lo.split("-"))
+        y1, m1 = (int(x) for x in hi.split("-"))
+        out = []
+        y, m = y0, m0
+        while (y, m) <= (y1, m1):
+            out.append(f"{y:04d}/{m:02d}/01")
+            m += 1
+            if m > 12:
+                y, m = y + 1, 1
+        return out
+    if args.dates:
+        return [d.strip() for d in args.dates.split(",") if d.strip()]
+    return [args.date]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("name", choices=structured_universes.names())
-    ap.add_argument("--date", default="2024/01/01", help="Tardis free sample = 1st of month")
+    ap.add_argument("--date", default="2024/01/01", help="single Tardis free sample = 1st of month")
+    ap.add_argument("--dates", default=None,
+                    help="comma list of YYYY/MM/DD (overrides --date)")
+    ap.add_argument("--months", default=None,
+                    help="YYYY-MM:YYYY-MM -> 1st of each month inclusive (free samples)")
     ap.add_argument("--out-dir", default="data/_adapter_raw")
     ap.add_argument("--cache-dir", default="data/_tardis_cache")
     ap.add_argument("--max-rows", type=int, default=300_000, help="0 = all rows")
@@ -212,9 +231,10 @@ def main() -> None:
                     help="lead-lag grid (fine; spot/perp lead-lag is sub-100ms)")
     ap.add_argument("--ll-max-lag-ms", type=float, default=500.0)
     args = ap.parse_args()
+    dates = _resolve_dates(args)
     build(
         args.name,
-        date=args.date,
+        dates=dates,
         out_dir=Path(args.out_dir),
         cache_dir=Path(args.cache_dir),
         max_rows=None if args.max_rows == 0 else args.max_rows,

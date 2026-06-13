@@ -105,7 +105,27 @@ REGISTRY: Dict[str, StructuredSpec] = {
     # A
     "btc_spot_perp": _spot_perp("BTCUSDT"),
     "eth_spot_perp": _spot_perp("ETHUSDT"),
-    # B  (symbol ids are venue-native; coinbase/okex use different quote/format)
+    # B  -- clean USDT-quoted venues (no cross-quote contamination): the basis
+    # P_a - P_b is a true cross-exchange spread because both are BTC/USDT.
+    "btc_cross_usdt": _cross_venue(
+        "BTC",
+        [
+            LegSpec("BTC_binance", "tardis", "binance", "BTCUSDT"),
+            LegSpec("BTC_okex", "tardis", "okex", "BTC-USDT"),
+        ],
+    ),
+    "btc_cross_usdt3": _cross_venue(  # N=3 exercises the >2-asset graph
+        "BTC",
+        [
+            LegSpec("BTC_binance", "tardis", "binance", "BTCUSDT"),
+            LegSpec("BTC_okex", "tardis", "okex", "BTC-USDT"),
+            LegSpec("BTC_bybit", "tardis", "bybit", "BTCUSDT"),
+        ],
+    ),
+    # B (mixed-quote, kept for reference): coinbase is BTC/USD, so the basis vs
+    # binance/okex (BTC/USDT) carries the slowly-drifting USDT/USD peg as a
+    # large offset -> weak/biased. Use btc_cross_usdt for the clean experiment,
+    # or quote-convert coinbase by USDT/USD before differencing.
     "btc_cross_exchange": _cross_venue(
         "BTC",
         [
