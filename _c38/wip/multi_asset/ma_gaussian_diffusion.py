@@ -12,6 +12,7 @@ loss has shape ``(B,)`` and slots straight into the existing schedule
 sampler. This matches §2.5 of `workflow.md`.
 """
 
+import os
 import numpy as np
 import torch
 from einops import repeat
@@ -494,8 +495,22 @@ class MultiAssetGaussianDiffusion(nn.Module):
     # ---- loss helpers (per-asset shapes) --------------------------------
 
     def _mse_loss_per_asset(self, noise_t, noise_true):
-        """L2 norm of noise residual per (batch, asset). Returns (B, N)."""
+        """L2 norm of noise residual per (batch, asset). Returns (B, N).
+
+        TIME_LOSS_W>1 upweights the time channel (idx 0) of the epsilon error
+        to attack the inter_arrival weakness (NEXT_WORK_ZH.md task 2.2).
+        """
         diff = noise_t - noise_true  # (B, N, K, F)
+        tw = float(os.environ.get("TIME_LOSS_W", "1.0"))
+        if tw != 1.0:
+            w = torch.ones(diff.shape[-1], device=diff.device, dtype=diff.dtype)
+            w[0] = tw ** 0.5  # squared inside L2 norm -> effective weight tw
+            diff = diff * w
+        # MSE_REDUCE='mean' (task 3.2): mean-of-squares per asset instead of the
+        # L2 norm. Norm scale ~sqrt(K*F) makes the early epsilon gradient hot ->
+        # seed-sensitivity; mean keeps it O(1). Default 'norm' = baseline.
+        if os.environ.get("MSE_REDUCE", "norm") == "mean":
+            return (diff ** 2).mean(dim=[2, 3])
         return torch.norm(diff, p=2, dim=[2, 3])
 
     def _vlb_loss_per_asset(self, noise_t, pred_log_var, x_0, x_t, t,

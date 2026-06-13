@@ -383,6 +383,33 @@ SMOKE=0 NDEV=1 EPOCHS=5 DISABLE_GRAPH=1 CUDA_VISIBLE_DEVICES=1 python run_ma_c38
 - option (b) log-time 参数化:模型有效但 inter_arrival **不变**(~0.93)。
 - **option (c) 点过程头:✅ inter_arrival L1 0.886→0.840、Wasserstein 1.21→0.50(2 seed 稳)** —— 证实"问题在序贯时间生成机制,需用点过程而非损失/参数化去治"。代价是 vol_per_min 等时间耦合项,需联调(如点过程与扩散联合训练 / 共享上下文)。**任务桶2 §2.2 用 option (c) 取得正向进展(分布层面显著);后续可把点过程头并入主干联合训练以避免 vol_per_min 退化。** 全部补丁/数据可逆(`TIME_LOSS_W` 默认 1.0、`PP_CKPT` 不设即原行为、`*_lt` 与 `pp/` 为新增,不影响其他实验)。
 
+### 3.4m 训练稳定性:warmup+cosine vs mean-loss(任务桶3 §3.2,2026-06-13)
+
+**问题**:§3.4f 定的"LR=3e-4 稳、1e-3 种子不稳"是绕过而非根治。桶3 §3.2 给的两条 lever:(a) LR warmup+cosine 调度、(b) `_mse_loss_per_asset` L2-norm→mean。目标:能用回 LR≥1e-3 且种子稳。
+
+**做法(env-gated,默认=旧行为,全部可逆)**:`ma_gaussian_diffusion._mse_loss_per_asset` 加 `MSE_REDUCE`(默认 `norm` = `torch.norm(p=2)`,`mean` = 每资产 mean-of-squares,把 loss 尺度从 ~√(K·F) 压到 O(1));`ma_diffusion_engine.configure_optimizers` 加 `LR_SCHED`(默认 `plateau` = 旧的 on_validation 手动砍半,`cosine` = 线性 warmup(`WARMUP_FRAC`=0.05)后 cosine 衰减,逐 step,且跳过手动砍半)。备份 `*.bak_stab`。补丁脚本 `_c38/patch_stability.py`,驱动 `_c38/stab_{ab,r3}_driver.sh`。MA no-graph BTC+ETH,5ep,LR=1e-3。
+
+**关键方法点**:`MSE_REDUCE=mean` 改变 val_ema **量纲**(mean≈norm/√(K·F)),故 mean 跑出来的 val 数字小是假象,**不可与 norm 的 val 横比**。公平横比一律用 `eval_p0`(teacher-forced 逐笔预测 z 空间 L1,与 loss reduction 无关),ETH(BTC peer)+ BTC(ETH peer),N_POS=3000,DDIM-10。
+
+**结果(`eval_p0` cont_l1,越低越好;val_ema 仅同量纲内可比)**:
+
+| 配方 | LR | reduce | sched | val_ema | ETH cont_l1 | BTC cont_l1 | seeds |
+|---|---|---|---|---|---|---|---|
+| anchor(旧默认) | 3e-4 | norm | plateau | 0.963 | 0.221 | 0.253 | 1 |
+| B | 1e-3 | norm | plateau | 0.927 | 0.186 | 0.231 | 1 |
+| A | 1e-3 | mean | plateau | →1.5e16 | 6.33 | 6.40 | 1(发散) |
+| T | 1e-3 | mean | cosine | 0.145* | 0.230/0.238 | 0.275/0.281 | 2 |
+| **nc(推荐)** | 1e-3 | norm | **cosine** | **0.897/0.898** | **0.185/0.185** | **0.225/0.220** | 2 |
+
+\*mean 量纲,不可比。
+
+**结论(诚实,定稿)**:
+- ✅ **cosine warmup 是对的 lever**:`nc`(norm+cosine,LR=1e-3)val_ema 0.897(< B 0.927 < anchor 0.963),cont_l1 ETH 0.185 / BTC 0.22 —— **追平历来最好的 B、并优于旧 3e-4 默认(0.221/0.253)**;**2 seed 极稳**(ETH cont_l1 0.1849 vs 0.1853,差 0.0004;val 0.897/0.898);且**从 epoch 0 平滑下降,没有 B 在 1e-3 下头 ~1.5 epoch 的瞎晃**(B:5.31→4.87→2.47 才被手动砍半救回)。**桶3 §3.2 目标(用回 LR≥1e-3 且种子稳)达成。**
+- ❌ **mean reduction 是错的 lever**:`T` 的 val 0.145 是量纲假象,**实测 cont_l1 反而更差**(ETH 0.234 vs norm 0.185,BTC 0.278 vs 0.22)——mean 只让 price 通道略好(l1_price 0.023 vs 0.026),size/time 更差,净更差;`A`(mean+旧 plateau)直接**数值发散到 1.5e16**(固定 0.002 砍半阈值对 mean 小尺度误触发/失配)。**这推翻了 memory 里"L2-norm loss scale 是种子敏感主因"的猜测**——真因是缺 warmup,不是 loss reduction。
+- 📌 **附带发现**:B(norm+plateau@**1e-3**)cont_l1 0.186 比 anchor(norm+plateau@**3e-4**)0.221 **更好**——起始 LR 高 + 衰减比固定低 LR 找到更好的解(anchor 仅 n=1,nc 的 2 seed 0.185 已坐实此结论)。
+- **推荐默认**(未改 launcher 默认值,保持可复现;新跑显式带):`MSE_REDUCE=norm LR_SCHED=cosine LR=1e-3`。ckpt:`*_c38_{nc,mc,base,mean}_lr1e3_s{1234,42}.ckpt`;eval `AIQuant_logs/stab_{eval,nceval}.log`。
+- **lob_bench AR 复核(nc s1234,8窗×500,DDIM-10,vs §3.4i 旧 baseline ng_s1234)**:**ETH MEAN(all) 0.482→0.444(真实改善 ~0.04)**,BTC 0.456→0.461(持平)。改善来自 spread(ETH 0.976→0.947)、imbalance(0.265→0.220)、**vol_per_min(BTC 0.341→0.243、ETH 0.390→0.238 两资产大降)**;**inter_arrival 略差**(BTC 0.80→0.90、ETH 0.90→0.92,此次未挂点过程头,时序仍短板)。即 **nc 配方在分布层面至少不亏、ETH 小赚**,稳定性增益渗到部分盘口动态;但单训练种子,ETH 的 0.04 建议多 seed 复核。输出 `data/lobbench/ar_nc/<asset>/`,驱动 `_c38/stab_lobbench_nc.sh`。
+
 ### 3.5 当前状态
 
 - ✅ 环境打通；p0/p1 smoke + 单卡 MA_TRADES 训练在 GPU 上通过
