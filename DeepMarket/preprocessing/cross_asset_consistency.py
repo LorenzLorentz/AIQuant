@@ -38,9 +38,20 @@ def mids_from_arrays(arrays: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     return out
 
 
+def spread_groups(universe):
+    """Deterministic ``[(etf_idx, [(asset_idx, weight), ...]), ...]`` from a universe.
+
+    Inlined (mirrors arbitrage/spread_computer.spread_groups) so the metric has no
+    dependency on the P2/P3 modules, which aren't deployed on the training cluster.
+    """
+    return [
+        (int(etf_idx), [(int(i), float(w)) for i, w in sorted(basket.items())])
+        for etf_idx, basket in sorted(universe.etf_basket_weights.items())
+    ]
+
+
 def basis_series(mids: Dict[str, np.ndarray], universe) -> Dict[str, np.ndarray]:
     """Per spread-group basis ``mid[etf] - sum_i w_i mid[i]`` (group key = etf name)."""
-    from models.diffusers.multi_asset.arbitrage.spread_computer import spread_groups
     names = list(universe.assets)
     out = {}
     for etf_idx, basket in spread_groups(universe):
