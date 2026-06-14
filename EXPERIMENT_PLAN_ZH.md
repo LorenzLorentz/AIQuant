@@ -468,6 +468,30 @@ SMOKE=0 NDEV=1 EPOCHS=5 DISABLE_GRAPH=1 CUDA_VISIBLE_DEVICES=1 python run_ma_c38
 - **C**:`qqq_basket20` = QQQ + top-20 Nasdaq-100(AAPL…AMAT,**~65% 权重覆盖**,远好于之前 4 只的 30%);`fetch_databento --rth`(DST 正确,09:30–16:00 ET,免单独 clip);4 个 RTH session(2024-03-01/06-03/09-03/12-02)跨全年 regime。**实际再花 $13.05**(累计 Databento 花费 ≈ $19,$125 预算用 ~15%)。权重为近似官方值,正式 no-arb 前可换 per-date NPORT;65% 仍部分篮子 → delta_base 用实测基差校准,真·零基差带仍以 scheme A 为准。
 - 旧 `data/*_rth`(4 只版)与 6 月版已被覆盖/作废。
 
+### 3.4o 桶4.3 图耦合头对头(结构化 spot/perp,2026-06-14)—— 结论:真 lead-lag 下图仍无一致增益
+
+在**经过 lead-lag 验证**的 `btc_spot_perp`(perp 领先 spot,HY 0.6)上跑 graph ON(释放 gamma,GRAPH_LR=3e-4)vs OFF,3 seed 配对,LR=3e-4、5ep、LIMIT_TRAIN_BATCHES=2000(数据 180万行)。这是桶4 的核心检验:换上有结构的数据,图能否复活(对比 BTC+ETH 的 null §3.4h)。
+
+**三个镜子,3 seed,全部一致指向"无一致增益":**
+
+| seed | val ON/OFF (Δ) | gamma 终值 | metric③ gen-basis ON/OFF (lower=好) |
+|---|---|---|---|
+| 1234 | 0.838/0.817 (+0.021) | **+0.085** | 3819/6159 (g好) |
+| 42 | 0.817/0.825 (−0.008) | **−0.094** | 5881/4119 (g差) |
+| 7 | 0.845/0.831 (+0.014) | **+0.080** | 5821/6822 (g好) |
+| 均值 | Δ **+0.009±0.015**(打平) | **\|γ\|≈0.086,符号翻转** | 5173/5700(打平,符号翻转) |
+
+**关键发现(比 BTC+ETH 更丰富的负结果):**
+1. **真 lead-lag 确实强烈激活图分支**:|γ|≈0.086,是 BTC+ETH(~0.01,§3.4h)的 **~9×** —— 数据有结构 → 图分支拿到强梯度。所以"数据结构影响图是否被使用"成立。
+2. **但残差小门控 `eps_fused=eps_local+γ·MLP` 没把它转成一致增益**:val Δ 在噪声内、符号 2:1 混;γ 符号 seed 间翻转(+/−/+)→ 优化器没收敛到一致的耦合方向;metric③ 同样符号翻转。**激活 ≠ 有用。**
+3. **【新】跨资产 basis 信号低于模型价格生成分辨率**:perp−spot basis≈$57(≈价格 0.1%),而模型一步价格预测误差≈$4000(z-error~0.27 × price 列 12 月 std~$1.5万,被 2024 BTC $42k→$100k 大行情抬高)。AR rollout 直接发散($1.5万–6.8万 basis);teacher-forced 也被 $4000 噪声淹没。**即使图有耦合收益也测不到——basis 在分辨率地板以下。**
+
+**两条后续实验方向(由上述机制直接导出):**
+- **(A)相对/对数价格重参数化**:把订单 price 列改成"相对上一 mid 的增量"(z-score),使一步误差从 ~$4000 降到 ~$几十(实际波动尺度),让 basis($57)可测 —— 这也是 no-arb 设计(`spread_computer.price_is_delta=True`)本就假设的形式,但部署模型用的是绝对 z 价。**这是任何 basis 一致性增益能被观测到的前置。**
+- **(B)更强耦合**:给图分支加"预测对手资产下一步"的辅助损失,给它去噪损失之外的梯度(§3.1),治"门控太弱"。
+
+**工具/产物**:`run_ma_c38.py` 加 `UNIVERSE`/`LIMIT_TRAIN_BATCHES` 钮(从 `structured_universes` 选资产 + 注入 relation_types/etf_basket_weights);`preprocessing/cross_asset_consistency.py`(metric③:basis 分布 Wasserstein+histL1,inline spread_groups 无 P2/P3 依赖);`eval_consistency.py`(AR + TEACHER_FORCED 两模式,cluster);驱动 `_b4/b4_graph_matrix.sh`、`_b4/b4_cons_driver.sh`。**bucket-3 的 nc 配方(1e-3+cosine)在对齐 spot/perp 数据上 NaN(size z-score 极端值),改用稳定 LR=3e-4。** ckpt `*_b4_btcsp_{g,ng}_s{1234,42,7}`,metric③ JSON `data/consistency/btc_spot_perp/`。**P2/P3(spread/arbitrage)在 cluster 训练栈不存在(仅本地;ma_gaussian_diffusion 是 _identity_hook 桩),no-arb ON/OFF 需先移植+接线,属独立构建阶段。**
+
 ### 3.5 当前状态
 
 - ✅ 环境打通；p0/p1 smoke + 单卡 MA_TRADES 训练在 GPU 上通过
