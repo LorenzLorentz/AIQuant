@@ -492,6 +492,23 @@ SMOKE=0 NDEV=1 EPOCHS=5 DISABLE_GRAPH=1 CUDA_VISIBLE_DEVICES=1 python run_ma_c38
 
 **工具/产物**:`run_ma_c38.py` 加 `UNIVERSE`/`LIMIT_TRAIN_BATCHES` 钮(从 `structured_universes` 选资产 + 注入 relation_types/etf_basket_weights);`preprocessing/cross_asset_consistency.py`(metric③:basis 分布 Wasserstein+histL1,inline spread_groups 无 P2/P3 依赖);`eval_consistency.py`(AR + TEACHER_FORCED 两模式,cluster);驱动 `_b4/b4_graph_matrix.sh`、`_b4/b4_cons_driver.sh`。**bucket-3 的 nc 配方(1e-3+cosine)在对齐 spot/perp 数据上 NaN(size z-score 极端值),改用稳定 LR=3e-4。** ckpt `*_b4_btcsp_{g,ng}_s{1234,42,7}`,metric③ JSON `data/consistency/btc_spot_perp/`。**P2/P3(spread/arbitrage)在 cluster 训练栈不存在(仅本地;ma_gaussian_diffusion 是 _identity_hook 桩),no-arb ON/OFF 需先移植+接线,属独立构建阶段。**
 
+### 3.4p 桶4.3 exp A 相对价格 + 正确的跨资产指标(2026-06-14)
+
+绝对价 basis 测不了(地板),故重参数化:订单 price 列→相对上一 mid 的增量(abs std $13248→|delta| $0.23),重训 graph ON/OFF×3seed。
+
+**关键 1:basis-level metric③ 被证明是"被混淆的指标"**——绝对价下 basis($57)在分辨率地板下(gen~$4000);相对价下 basis 变 anchor-trivial(gen_spot=真上一mid+微小delta,g/ng 都 W=0.24 完美且无法区分,因每步移动$0.23≪basis$57)。两种情形都测不到耦合。
+
+**关键 2:正确指标 = anchor-free 的"目标下一步移动"预测 z-L1(条件含对手资产)**。eval_consistency 新增 pred_l1_{price,size}_z。3-seed(目标=spot 跟随,perp 领先):
+
+| seed | price_z ON/OFF | size_z ON/OFF |
+|---|---|---|
+| 1234 | 0.0267/0.0275 ✅ | 0.1625/0.1667 ✅ |
+| 42 | 0.0282/0.0278 ❌ | 0.1665/0.1712 ✅ |
+| 7 | 0.0280/0.0285 ✅ | 0.1644/0.1730 ✅ |
+| 均值 | ~1%,**符号翻转 2/3** | **~3.4%,3/3 一致** |
+
+**结论(细致、诚实)**:残差门控图在 **price/val 上无一致收益**(perp→spot 价格 lead-lag 真但仅 ~10–40ms,对手信息与 spot 自身 255 步盘口冗余,治不了一步价格预测);但在 **size/活跃度通道有小而一致的收益(3/3,~3.4%)** —— 跨资产交易强度共动比价格 lead-lag 更稳健,图能用上。即"图非全无用,有可复现的跨资产\*活跃度\*效应,而非价格效应"。**下一步 B(辅助跨资产损失)有了可放大的真实信号。**
+
 ### 3.5 当前状态
 
 - ✅ 环境打通；p0/p1 smoke + 单卡 MA_TRADES 训练在 GPU 上通过
