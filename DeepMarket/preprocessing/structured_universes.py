@@ -105,6 +105,16 @@ REGISTRY: Dict[str, StructuredSpec] = {
     # A
     "btc_spot_perp": _spot_perp("BTCUSDT"),
     "eth_spot_perp": _spot_perp("ETHUSDT"),
+    # A, relative-price variant (bucket 4.3 exp A): order price = delta-from-prev
+    # mid so the basis is above the model's price resolution. Derived locally via
+    # build_relprice_data.py from the btc_spot_perp _adapter_raw npy (not fetched).
+    "btc_spot_perp_rp": StructuredSpec(
+        scheme="A",
+        universe=AssetUniverse.basis_pair(reference="BTCUSDT_perp_rp", leg="BTCUSDT_spot_rp"),
+        legs=[LegSpec("BTCUSDT_perp_rp", "derived", "relprice", "BTCUSDT_perp"),
+              LegSpec("BTCUSDT_spot_rp", "derived", "relprice", "BTCUSDT_spot")],
+        notes="relative-price (delta-from-prev-mid) variant of btc_spot_perp",
+        free=False),
     # B  -- clean USDT-quoted venues (no cross-quote contamination): the basis
     # P_a - P_b is a true cross-exchange spread because both are BTC/USDT.
     "btc_cross_usdt": _cross_venue(
