@@ -190,6 +190,70 @@
 
 ---
 
+## 5. 救 P1(图耦合)& P3(no-arb)—— 两条上行路线(2026-06-15 新增)
+
+> **背景(读 `EXPERIMENT_PLAN_ZH.md` §3.4n–q,别重做)**:桶4.3 已把 P1、P3 在**经济结构化、lead-lag 验证过**的数据上判为**负结果(均有机制解释)**:
+> - **P1 图**:真 lead-lag 强烈激活图(\|γ\|≈0.086,9× BTC+ETH),但 val/价格无一致收益(符号翻转);救图的 A(相对价格,只是测量修复)、B(辅助损失,反更差)都失败;免费 crypto **无慢 lead-lag 对**(spot/perp sub-100ms;跨币同步)。
+> - **P3 no-arb**:已移植到 cluster 并修好空-spread_groups 的 NaN,接进生成采样;但**控不住 AR rollout 的 basis 漂移**(λ 扫 10/100/1000,最好仅把 280× 过大的 basis 削 11%)。
+> - **共因**:两机制都在**逐步去噪(per-step eps)**层动作,而跨资产一致性问题(rollout basis 漂移)在**多步引擎重建**层 → 层级错配;书稳定时(teacher-forced)basis 又 anchor-trivial(无可改)= catch-22。
+> - ✅ 唯一正结果是 **P0 共享主干**(§2.1)。**本桶 = 这两个负结果的两条上行路线;若不做,直接按"P0 正 + P1/P3 负(带机制)"收口写论文也是完整结论。**
+
+### 5.1 救 P1 —— 换"慢 lead-lag"数据(让对手信息不冗余)
+
+**核心判据(这是关键,别再犯 spot/perp 的错)**:lead-lag 的**时标必须 ≫ 生成步长 / 目标自身盘口的"信息新鲜度"**。spot/perp 领先仅 10–40ms,等模型生成下一笔时,领先方那一下早已进入跟随方自己最近 255 步的盘口 → 图传过去的是**冗余**信息。要让图有非冗余信号,需要**秒级、甚至分钟级**的领先,且跟随方的盘口此时**还没反映**领先方的移动。
+
+**候选数据源(按性价比/可得性)**:
+
+1. **【最推荐】大盘股领先小盘股(同板块,分钟级)** —— 经典 Lo-MacKinlay lead-lag,流动性高的大盘领先同板块小盘**分钟级**,远超生成步长,非冗余。
+   - 取数:Databento `mbp-10`,选一个板块(如半导体 NVDA/AVGO 领先若干中小盘半导体;或科技龙头领先中盘)。每 symbol ~$1–2/日,$100 余额够 ~10 标的 × 数日。
+   - 对齐:用现成 `build_structured_pairs`/`fetch_databento` 的 LOCF 对齐(RTH);`spread_groups` 填"小盘 = f(大盘)"或就用有向 relation。
+   - 风险:小盘 tick/停牌/盘口稀;先用 `lead_lag.py` 粗网格筛出确有分钟级领先的对。
+
+2. **【信号最强、跨市场】BTC 领先 crypto 关联股(MSTR / COIN,秒–分钟级)** —— BTC(24/7)领先 MSTR/COIN(股票 RTH)是公认的慢跟随;两者制度不同 → 跟随有真实滞后,非冗余。
+   - 取数:BTC 用 Tardis(免费)+ MSTR/COIN 用 Databento `mbp-10`(付费);在 **RTH 重叠时段**对齐(crypto 始终在,股票 9:30–16:00 ET)。
+   - 这对**最可能给图一个有向、非冗余的信号**;但要处理双源时间对齐(已有 `_abs_seconds` + `align_legs`,把 BTC 重采样到股票 RTH 网格)。
+
+3. **【次选】ADR ↔ 母市场上市(跨时区,重叠窗口)** —— 母市场领先 ADR(或反之)秒级。
+   - 取数:Databento(美股 ADR)+ 母市场 L2(可能需 LSEG/学校源,较重);仅在两市场重叠的~1–2h 窗口对齐。
+   - 风险:重叠窗短、母市场数据获取重 → 优先级低于 1、2。
+
+4. **【探针,几乎零成本】跨所"慢交易所"** —— 某小交易所更新慢、滞后于币安。Tardis 覆盖 30+ 所;用 `lead_lag.py` 粗网格(1s/5s)扫 BTC@binance vs BTC@{小所},找 peak_lag 在秒级的。便宜,可先做。
+
+**前置工具改动**:`lead_lag.py` 现默认 10ms 网格(为 spot/perp);救 P1 时用**粗网格 + 大 max-lag**(`--grid-ms 1000 --max-lag-ms 60000`)才能分辨秒/分钟级。**入训前必须确认**:peak_lag ≫ 生成步长、corr 显著、方向跨日一致(否则又是同步/噪声)。
+
+**实验**:在筛出的慢 lead-lag 对上重跑 §3.4o 的 graph ON vs OFF(3 seed,LR=3e-4,稳定配方),用 **anchor-free 预测-L1**(`eval_consistency` TEACHER_FORCED,看 price_z)而非 val。**期望**:若领先方信息非冗余,graph ON 的 price_z 应**一致优于** OFF(不再符号翻转)。
+
+### 5.2 救 P3 —— 把 no-arb 从"逐步 eps 引导"改成"轨迹级一致性"
+
+**根因复述**:当前 `ArbitrageEnergyGuidance` 在反向扩散**每一步**改 eps,但 rollout 的 basis 漂移是**跨多个生成事件、在撮合引擎重建的盘口上累积**的;层级错配 → 引导反应的是"已经漂飞的盘口",λ 大反而发散。
+
+**策略调整(按推荐顺序,可组合)**:
+
+1. **【前置·必做】先稳住 rollout 本身**。no-arb 救不了一个本就发散的 rollout(§3.4i 已记:gen 类型配比净抽流动性 → 盘口枯竭 → 价格漂走)。先做:
+   - **scheduled sampling / self-conditioning 训练**:训练时让模型**见到自己生成的(漂移的)盘口**作为条件(而非永远真盘口),减小 train/rollout 分布偏移;
+   - **盘口/流动性守恒先验**:对生成的 order 类型配比(limit/cancel/exec)加先验或约束,避免净抽流动性;
+   - 用**相对价格**模型(§3.4p,价格=增量)做 rollout,价格漂移天然有界。
+   - 验收:无引导的 AR rollout basis 不再 280× 发散(降到个位数倍)。**这是 P3 能起作用的前提。**
+
+2. **【核心】把 no-arb 变成训练期"轨迹级一致性损失"**(信号放到漂移所在的多步层级):
+   - 训练时 roll out K 步(或用 §5.2.1 的 self-conditioning),在重建的盘口上算 basis 轨迹,惩罚 `Σ_k relu(\|basis_k\| − δ)²`;
+   - 即把能量从"生成时 eps 引导"挪到"训练目标",让模型**学会**保持联合轨迹的 basis 有界,而不是生成时硬掰。
+
+3. **【引擎级软投影】** 若仍要生成时干预,**在撮合引擎重建盘口之后**(漂移所在层)做软投影:把 gen mid 朝 no-arb 带 `[peer−δ, peer+δ]` 拉一点(可微/可控强度),而不是改 per-step eps。匹配"问题在多步引擎层"的层级。
+
+4. **【坐标修复】basis 要在共享坐标算**:当前每资产**各自 z-score** → basis 的 z 值带偏置(perp/spot 均值不同),`compute_spread` 在 z 空间不是真 basis。改成在**原始价格或对数收益**坐标算 basis(或用统一 z),`delta_base` 同坐标校准。否则 no-arb 在拟合一个被偏置污染的量。
+
+5. **【联合生成】** 测 no-arb 时**两资产联合 rollout**(而非 peer 永远真),让能量约束二者的**相互**关系;配合 §5.2.1 的稳定化。
+
+6. **训练 P3 头**:别再 zero-init 不训的生成时引导;把 `StressHead`+energy 随主干**联合训练**(用 §5.2.2 的轨迹损失),让 δ_dyn 自适应。
+
+**指标**:在**稳定化后的** rollout 上,用**共享坐标 basis** 比 no-arb ON vs OFF 的 basis 偏离分布(`cross_asset_consistency.py`);并交叉看 anchor-free 预测-L1。**别用** anchor-trivial 的 teacher-forced basis,也别用发散的绝对价 rollout。
+
+### 5.3 验收(整桶)
+- **P1**:在**经 lead-lag 粗网格验证(秒/分钟级、方向一致)**的对上,graph ON 的 anchor-free price_z 预测**多 seed 一致优于** OFF(翻转"图无用");否则产出"受控负结果:即便慢 lead-lag,图仍无用"。
+- **P3**:先证明 rollout 已稳(basis 不发散),再证明**轨迹级 no-arb**(而非 per-step 引导)把 basis 偏离压向 real、且优于无约束;否则产出"per-step 引导层级错配、需轨迹级目标"的明确结论。
+- 两者任一成功 → P1/P3 从"负"翻"正",论文从"P0 正 + 两负"升级;失败 → 负结果更扎实(带"为何")。
+
 ## 附录:操作速查(已在本环境验证)
 
 **连 cluster38**(唯一通路,密码在脚本内):
