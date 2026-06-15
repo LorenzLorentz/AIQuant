@@ -509,6 +509,18 @@ SMOKE=0 NDEV=1 EPOCHS=5 DISABLE_GRAPH=1 CUDA_VISIBLE_DEVICES=1 python run_ma_c38
 
 **结论(细致、诚实)**:残差门控图在 **price/val 上无一致收益**(perp→spot 价格 lead-lag 真但仅 ~10–40ms,对手信息与 spot 自身 255 步盘口冗余,治不了一步价格预测);但在 **size/活跃度通道有小而一致的收益(3/3,~3.4%)** —— 跨资产交易强度共动比价格 lead-lag 更稳健,图能用上。即"图非全无用,有可复现的跨资产\*活跃度\*效应,而非价格效应"。**下一步 B(辅助跨资产损失)有了可放大的真实信号。**
 
+### 3.4q 桶4.3 exp B(辅助损失)+ TASK(no-arb P3)(2026-06-15)—— 两机制均负,桶4 收口
+
+**B 辅助跨资产损失(救图尝试)= 负**:`ma_gaussian_diffusion` 加 `AUX_LOSS_W`(aux_head 用对手聚合消息预测本资产 clean x0;env 门控、向后兼容、备份 .bak_auxloss)。s1234 rp 预测-L1(price_z/size_z):no-graph 0.0275/0.1667、plain-graph 0.0267/0.1625、**aux-w1 0.0279/0.1650、aux-w5 0.0279/0.1705**。aux 在两通道都比 plain-graph 差、且随权重单调变差 → 直接监督扭曲了 fusion 表征,不放大反损。
+
+**数据方向探针 = 无慢 lead-lag 对**:BTC vs SOL/DOGE/AVAX/ALGO(200ms 网格)全部 leader=synchronous、peak_lag=0 → 免费 crypto 里要么 sub-100ms(spot/perp)要么同步(跨币),没有秒级 lead-lag。慢 lead-lag 需付费股票(ADR↔母市/跨上市)。
+
+**TASK no-arb P3 = 负**:移植 arbitrage/+spread/ 到 cluster(原仅本地);真 spot/perp batch energy **有限**(z-basis 0.97,§3.4 的 P3 NaN 确认是空 spread_groups,现修复)。在生成时把 `ArbitrageEnergyGuidance` 设为 `post_fusion_hook`(ddim_single_step 会调用 → DDIM 采样生效,不需重训)。AR rollout(绝对价 ng_s1234,生成 spot、perp 真)OFF gen-basis absmean 17044(真 53.6,发散);no-arb λ=10/100/1000 → 19146/15185/33391。**最好(λ100)仅把 280× 过大的 basis 削 ~11%,非单调,λ1000 直接发散。** P3 控不住 rollout 漂移。
+
+**根因(两机制共因)**:graph/no-arb 都在**逐步去噪**层面动作(per-step eps),但跨资产一致性问题(rollout basis 漂移)在**多步引擎重建**层面 → 层级错配;而书稳定时(teacher-forced)basis 又 anchor-trivial(无可改)= 同一 catch-22。
+
+**桶4 总结论(诚实、完整)**:**两个新机制 P1(图耦合)、P3(no-arb)在经济结构化、lead-lag 验证过的数据上均无收益,且有清晰机制解释;唯一正结果是 P0 共享主干(桶2.1 救数据贫瘠资产)。** 论文骨架=「共享多资产主干有用;显式图耦合与 no-arb 引导无用(给出机制)」。后续上行需:P1 付费股票慢 lead-lag 数据;P3 改为**轨迹级/多步一致性目标**(而非 per-step eps 引导)。
+
 ### 3.5 当前状态
 
 - ✅ 环境打通；p0/p1 smoke + 单卡 MA_TRADES 训练在 GPU 上通过
